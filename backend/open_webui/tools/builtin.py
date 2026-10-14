@@ -667,7 +667,11 @@ async def execute_code(
     or run any Python code that would help answer the user's question.
 
     :param code: The Python code to execute
-    :return: JSON with stdout, stderr, and result from execution
+    :return: JSON with stdout, stderr, result, and files. Images the code prints as
+        ``data:image/...;base64,`` data URIs are uploaded and listed under ``files``
+        (``id``, ``url``, ``name``, ``path``); ``path`` is the file on the server — pass
+        it to a file-upload tool (e.g. the wiki writer's ``upload-file``) to deliver the
+        file. The bytes are already stored, so do not re-send or re-encode them.
     """
     from uuid import uuid4
 
@@ -816,6 +820,11 @@ async def execute_code(
         }
         if output_files:
             response['files'] = output_files
+            response['files_note'] = (
+                'Images in files[] are already uploaded; each path is the file on the '
+                'server. To deliver a file (e.g. upload a chart to a wiki), pass its path '
+                'to a file-upload tool — do not re-encode or re-send the bytes.'
+            )
 
         return JSONCodec.dumps(response, ensure_ascii=False)
     except Exception as e:
