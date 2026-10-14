@@ -1,0 +1,107 @@
+name: ronzz artifact-pipeline
+
+# CI for the ronzz Open WebUI fork: the source-level regression gate (the public
+# open-webui/tests suite, run fork-aware in fast mode), the derived-image build with
+# a boot smoke, and — on a push to the branch — publishing the image to ghcr.
+
+on:
+  push:
+    branches: [ronzz/artifact-pipeline]
+  pull_request:
+    branches: [ronzz/artifact-pipeline]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ronzz-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Ruff (backend)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - run: pip install "ruff>=0.15.5"
+      - name: Format check
+        working-directory: backend
+        run: ruff format --check .
+      - name: Logic errors
+        working-directory: backend
+        run: ruff check --select=F --ignore=F401,F403,F405,F541,F811,F841 --output-format=github .
+
+  regression:
+    name: Regression (fast)
+    uses: Ron-RONZZ-org/open-webui-tests/.github/workflows/regression.yml@main
+    with:
+      open-webui-repository: Ron-RONZZ-org/open-webui
+      open-webui-ref: ${{ github.sha }}
+      tests-repository: Ron-RONZZ-org/open-webui-tests
+      tests-ref: main
+      fast: true
+      suite: integration/images
+
+  image:
+    name: Derived image (arm64) + smoke
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - name: Build derived image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.ronzz
+          platforms: linux/arm64
+          push: false
+          load: true
+          tags: owui-ronzz:ci
+      - name: Assert the patched modules are present
+        run: |
+          docker run --rm --entrypoint sh owui-ronzz:ci -c "grep -Fq '[\w.+-]' /app/backend/open_webui/utils/files.py && grep -Fq 'get_image_file_from_base64' /app/backend/open_webui/tools/builtin.py && echo PATCHED"
+      - name: Boot smoke (/health)
+        run: |
+          docker run -d --name owui-ci -e WEBUI_SECRET_KEY=ci-smoke -p 8080:8080 owui-ronzz:ci
+          ok=0
+          for i in $(seq 1 90); do
+            if curl -sf http://127.0.0.1:8080/health >/dev/null 2>&1; then ok=1; echo "healthy after ~$((i * 2))s"; break; fi
+            sleep 2
+          done
+          docker logs owui-ci --tail 40 2>&1 || true
+          docker rm -f owui-ci >/dev/null 2>&1 || true
+          [ "$ok" = "1" ] || { echo "the container did not become healthy"; exit 1; }
+
+  publish:
+    name: Publish image
+    needs: [lint, regression, image]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/ronzz/artifact-pipeline'
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.ronzz
+          platforms: linux/arm64
+          push: true
+          tags: |
+            ghcr.io/ron-ronzz-org/open-webui:ronzz-v0.12.0
+            ghcr.io/ron-ronzz-org/open-webui:ronzz-v0.12.0-sha-${{ github.sha }}
+      - name: Report digest
+        run: echo "### Published \`ghcr.io/ron-ronzz-org/open-webui:ronzz-v0.12.0\` — digest \`${{ steps.build.outputs.digest }}\`" >> "$GITHUB_STEP_SUMMARY"

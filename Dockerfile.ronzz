@@ -1,0 +1,23 @@
+# Derived Open WebUI image: the pinned upstream release plus the ronzz
+# "artifact pipeline" patch.
+#
+# The patch (see the source branch commits and the ADR
+# `docs/decisions/owui-artifact-pipeline.md` in ronzz-wikibase):
+#   A. the code interpreter persists every base64 image format, not just PNG;
+#   B. the execute_code result exposes the uploaded file record (id, url, name,
+#      path) so a downstream tool can reference the stored file.
+#
+# Only the patched backend modules are overlaid on the pinned base; the base
+# tag and this overlay are bumped together when upstream releases.
+FROM ghcr.io/open-webui/open-webui:v0.12.0
+
+COPY backend/open_webui/utils/files.py /app/backend/open_webui/utils/files.py
+COPY backend/open_webui/utils/middleware.py /app/backend/open_webui/utils/middleware.py
+COPY backend/open_webui/tools/builtin.py /app/backend/open_webui/tools/builtin.py
+
+# Drop bytecode cached in the base image for the replaced modules, so Python
+# recompiles them instead of importing a stale .pyc that predates the patch.
+RUN rm -f \
+      /app/backend/open_webui/utils/__pycache__/files.*.pyc \
+      /app/backend/open_webui/utils/__pycache__/middleware.*.pyc \
+      /app/backend/open_webui/tools/__pycache__/builtin.*.pyc
