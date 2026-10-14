@@ -637,6 +637,20 @@ async def ask_user(
 # =============================================================================
 
 
+def _image_output_file(file_item, image_url: str) -> dict:
+    """The record an execute_code result exposes for an uploaded image.
+
+    ``path`` is the server-side location of the stored file (under UPLOAD_DIR) so the
+    model can hand it to a downstream file-upload tool without re-sending the bytes.
+    """
+    return {
+        'id': file_item.id,
+        'url': image_url,
+        'name': (file_item.meta or {}).get('name') or file_item.filename,
+        'path': file_item.path,
+    }
+
+
 async def execute_code(
     code: str,
     __request__: Request = None,
@@ -750,11 +764,12 @@ async def execute_code(
 
         # Handle image outputs (base64 encoded) - replace with uploaded URLs
         # Get actual user object for image upload (upload_image requires user.id attribute)
+        output_files = []
         if __user__ and __user__.get('id'):
             from open_webui.models.users import Users
             from open_webui.utils.files import (
                 BASE64_IMAGE_URL_PREFIX,
-                get_image_url_from_base64,
+                get_image_file_from_base64,
             )
 
             user = await Users.get_user_by_id(__user__['id'])
@@ -764,7 +779,7 @@ async def execute_code(
                 stdout_lines = stdout.split('\n')
                 for idx, line in enumerate(stdout_lines):
                     if BASE64_IMAGE_URL_PREFIX.match(line):
-                        image_url = await get_image_url_from_base64(
+                        image_url, file_item = await get_image_file_from_base64(
                             __request__,
                             line,
                             __metadata__ or {},
@@ -772,6 +787,8 @@ async def execute_code(
                         )
                         if image_url:
                             stdout_lines[idx] = f'![Output Image]({image_url})'
+                            if file_item is not None:
+                                output_files.append(_image_output_file(file_item, image_url))
                 stdout = '\n'.join(stdout_lines)
 
             # Extract and upload images from result
@@ -779,7 +796,7 @@ async def execute_code(
                 result_lines = result.split('\n')
                 for idx, line in enumerate(result_lines):
                     if BASE64_IMAGE_URL_PREFIX.match(line):
-                        image_url = await get_image_url_from_base64(
+                        image_url, file_item = await get_image_file_from_base64(
                             __request__,
                             line,
                             __metadata__ or {},
@@ -787,6 +804,8 @@ async def execute_code(
                         )
                         if image_url:
                             result_lines[idx] = f'![Output Image]({image_url})'
+                            if file_item is not None:
+                                output_files.append(_image_output_file(file_item, image_url))
                 result = '\n'.join(result_lines)
 
         response = {
@@ -795,6 +814,8 @@ async def execute_code(
             'stderr': stderr,
             'result': result,
         }
+        if output_files:
+            response['files'] = output_files
 
         return JSONCodec.dumps(response, ensure_ascii=False)
     except Exception as e:

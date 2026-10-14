@@ -105,23 +105,32 @@ async def get_image_base64_from_url(url: str, user=None) -> Optional[str]:
         return None
 
 
-async def get_image_url_from_base64(request, base64_image_string, metadata, user):
+async def get_image_file_from_base64(request, base64_image_string, metadata, user):
+    """Uploads a base64 image data URI and returns the file URL and the stored file record.
+
+    The file record carries the server-side path of the stored file so a caller (e.g. the
+    execute_code tool) can expose it without re-sending the image bytes.
+    """
     if BASE64_IMAGE_URL_PREFIX.match(base64_image_string):
-        image_url = ''
         # Extract base64 image data from the line
         image_data, content_type = await get_image_data(base64_image_string)
         if image_data is not None:
-            _, image_file = await upload_image(
+            file_item, image_file = await upload_image(
                 request,
                 image_data,
                 content_type,
                 metadata,
                 user,
             )
-            image_url = image_file['url']
+            return image_file['url'], file_item
 
-        return image_url
-    return None
+        return '', None
+    return None, None
+
+
+async def get_image_url_from_base64(request, base64_image_string, metadata, user):
+    image_url, _ = await get_image_file_from_base64(request, base64_image_string, metadata, user)
+    return image_url
 
 
 async def convert_markdown_base64_images(request, content: str, metadata, user):
