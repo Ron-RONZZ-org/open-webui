@@ -44,7 +44,7 @@ jobs:
       tests-repository: Ron-RONZZ-org/open-webui-tests
       tests-ref: main
       fast: true
-      suite: integration/images
+      suite: unit/security/test_unsupported_tool_result_image_formats.py integration/images
 
   image:
     name: Derived image (arm64) + smoke
