@@ -109,6 +109,7 @@ from open_webui.utils.misc import (
     add_or_update_system_message,
     add_or_update_user_message,
     convert_output_to_messages,
+    data_uri_media_type,
     extract_urls,
     get_content_from_message,
     get_last_assistant_message,
@@ -1059,12 +1060,45 @@ async def apply_source_context_to_messages(
 
 BASE64_IMAGE_DATA_URI_RE = re.compile(r'data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/]+={0,2}', re.IGNORECASE)
 
+# An SVG is XML, so a model that cannot receive it as an image part can still
+# read it as text. Bound the inline copy so a huge diagram cannot flood the
+# context; the file itself remains available for a downstream tool.
+MAX_INLINE_SVG_SOURCE_CHARS = 20_000
+
+
+def _is_svg_mime_type(content_type: str | None) -> bool:
+    return (content_type or '').split(';')[0].strip().lower() == 'image/svg+xml'
+
+
+def _data_uri_base64_payload(data_uri: str) -> str:
+    _, separator, payload = data_uri.partition(';base64,')
+    return payload if separator else ''
+
+
+def inline_svg_source(base64_data: str) -> str:
+    """Render an SVG image as text the model can read in place of an image input."""
+    try:
+        source = base64.b64decode(base64_data).decode('utf-8')
+    except ValueError as e:
+        log.warning('Could not decode SVG source: %s', e)
+        return '[SVG source unavailable: the image data could not be decoded]'
+
+    truncated = ''
+    if len(source) > MAX_INLINE_SVG_SOURCE_CHARS:
+        omitted = len(source) - MAX_INLINE_SVG_SOURCE_CHARS
+        source = source[:MAX_INLINE_SVG_SOURCE_CHARS]
+        truncated = f'\n… [truncated: {omitted} characters omitted]'
+
+    return f'[SVG source — image/svg+xml cannot be sent as a model image input]\n```xml\n{source}{truncated}\n```'
+
 
 def extract_base64_images(value: Any, files: list) -> Any:
     """Move base64 image data URIs out of a tool result so they do not reach the model as text."""
     if isinstance(value, str):
         if BASE64_IMAGE_DATA_URI_RE.fullmatch(value):
             files.append({'type': 'image', 'url': value})
+            if _is_svg_mime_type(data_uri_media_type(value)):
+                return inline_svg_source(_data_uri_base64_payload(value))
             return '[image]'
         return value
     if isinstance(value, dict):
@@ -1222,7 +1256,10 @@ async def process_tool_result(
     # tool_result_files and replace tool_result with a text summary.
     if isinstance(tool_result, str) and tool_result.startswith('data:image/'):
         tool_result_files.append({'type': 'image', 'url': tool_result})
-        tool_result = f'{tool_function_name}: Image file read successfully.'
+        if _is_svg_mime_type(data_uri_media_type(tool_result)):
+            tool_result = inline_svg_source(_data_uri_base64_payload(tool_result))
+        else:
+            tool_result = f'{tool_function_name}: Image file read successfully.'
 
     if isinstance(tool_result, list):
         if tool_type == 'mcp':  # MCP
@@ -1239,9 +1276,10 @@ async def process_tool_result(
                         tool_response.append(text)
                     elif item.get('type') in ['image', 'audio']:
                         mime_type = item.get('mimeType')
+                        data = item.get('data', item.get('blob', ''))
                         file_url = await get_file_url_from_base64(
                             request,
-                            f'data:{mime_type};base64,{item.get("data", item.get("blob", ""))}',
+                            f'data:{mime_type};base64,{data}',
                             {
                                 'chat_id': metadata.get('chat_id', None),
                                 'message_id': metadata.get('message_id', None),
@@ -1257,6 +1295,8 @@ async def process_tool_result(
                                 'content_type': mime_type,
                             }
                         )
+                        if item.get('type') == 'image' and _is_svg_mime_type(mime_type):
+                            tool_response.append(inline_svg_source(data))
                     elif item.get('type') == 'resource':
                         resource = item.get('resource', {})
                         text = resource.get('text', '')
@@ -1277,6 +1317,8 @@ async def process_tool_result(
                                         'content_type': resource_mime_type,
                                     }
                                 )
+                                if _is_svg_mime_type(resource_mime_type):
+                                    tool_response.append(inline_svg_source(resource_blob))
                             else:
                                 resource_uri = resource.get('uri', 'resource')
                                 tool_response.append(
