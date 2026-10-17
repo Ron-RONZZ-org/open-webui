@@ -1243,6 +1243,40 @@ def is_raster_image_content_type(content_type: str | None) -> bool:
     return base_content_type.startswith('image/') and base_content_type != 'image/svg+xml'
 
 
+# The image formats every mainstream vision endpoint accepts (OpenAI, Anthropic,
+# DeepSeek). Anything else — SVG, BMP, TIFF, HEIC, AVIF — is rejected by at least
+# one of them, so it must never be sent as an image input.
+MODEL_VIEWABLE_IMAGE_TYPES = frozenset(
+    {
+        'image/png',
+        'image/jpeg',
+        'image/webp',
+        'image/gif',
+    }
+)
+
+_DATA_URI_MEDIA_TYPE_RE = re.compile(r'^data:([^;,]+)', re.IGNORECASE)
+
+
+def data_uri_media_type(url: str | None) -> str | None:
+    """Return the media type of a ``data:`` URI, or None for any other URL."""
+    match = _DATA_URI_MEDIA_TYPE_RE.match(url or '')
+    return match.group(1).lower() if match else None
+
+
+def is_model_viewable_image(file_item: dict) -> bool:
+    """Return True when an image file item can be sent to a model as an image input.
+
+    SVG is XML, not a bitmap: vision endpoints reject ``image/svg+xml`` and the other
+    non-web formats (BMP, TIFF, HEIC, AVIF). An unknown content type is treated as
+    viewable so images from tools that omit metadata keep working.
+    """
+    content_type = file_item.get('content_type') or data_uri_media_type(file_item.get('url'))
+    if content_type is None:
+        return True
+    return content_type.split(';')[0].strip().lower() in MODEL_VIEWABLE_IMAGE_TYPES
+
+
 def extract_urls(text: str) -> list[str]:
     # Regex pattern to match URLs
     url_pattern = re.compile(r'(https?://[^\s]+)', re.IGNORECASE)  # Matches http and https URLs

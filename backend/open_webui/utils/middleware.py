@@ -120,6 +120,7 @@ from open_webui.utils.misc import (
     get_reasoning_details,
     get_response_error_detail,
     get_system_message,
+    is_model_viewable_image,
     is_raster_image_content_type,
     merge_system_messages,
     prepend_to_first_user_message_content,
@@ -1237,9 +1238,10 @@ async def process_tool_result(
                                 pass
                         tool_response.append(text)
                     elif item.get('type') in ['image', 'audio']:
+                        mime_type = item.get('mimeType')
                         file_url = await get_file_url_from_base64(
                             request,
-                            f'data:{item.get("mimeType")};base64,{item.get("data", item.get("blob", ""))}',
+                            f'data:{mime_type};base64,{item.get("data", item.get("blob", ""))}',
                             {
                                 'chat_id': metadata.get('chat_id', None),
                                 'message_id': metadata.get('message_id', None),
@@ -1252,6 +1254,7 @@ async def process_tool_result(
                             {
                                 'type': item.get('type', 'data'),
                                 'url': file_url,
+                                'content_type': mime_type,
                             }
                         )
                     elif item.get('type') == 'resource':
@@ -1271,6 +1274,7 @@ async def process_tool_result(
                                     {
                                         'type': 'image',
                                         'url': f'data:{resource_mime_type};base64,{resource_blob}',
+                                        'content_type': resource_mime_type,
                                     }
                                 )
                             else:
@@ -1785,7 +1789,8 @@ def get_images_from_messages(message_list):
         message_images = []
         for file in message.get('files', []):
             if file.get('type') == 'image':
-                message_images.append(file.get('url'))
+                if is_model_viewable_image(file):
+                    message_images.append(file.get('url'))
             elif is_raster_image_content_type(file.get('content_type')):
                 message_images.append(file.get('url'))
 
@@ -2494,7 +2499,8 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 image_files = [
                     f
                     for f in message.get('files', [])
-                    if f.get('type') == 'image' or is_raster_image_content_type(f.get('content_type'))
+                    if (f.get('type') == 'image' or is_raster_image_content_type(f.get('content_type')))
+                    and is_model_viewable_image(f)
                 ]
                 if message.get('role') == 'user' and image_files:
                     text_content = message.get('content', '')
@@ -3623,10 +3629,13 @@ async def resume_tool_calls(request, form_data, user, model, metadata, message) 
             for file_item in files:
                 if file_item.get('type') == 'image' and file_item.get('url', '').startswith('data:'):
                     image_url = await store_tool_result_image(request, file_item['url'], metadata, user)
-                    output_parts.append({'type': 'input_image', 'image_url': image_url})
+                    if is_model_viewable_image(file_item):
+                        output_parts.append({'type': 'input_image', 'image_url': image_url})
+                    else:
+                        display_files.append({**file_item, 'url': image_url})
                 else:
                     display_files.append(file_item)
-                    if file_item.get('type') == 'image' and file_item.get('url'):
+                    if file_item.get('type') == 'image' and file_item.get('url') and is_model_viewable_image(file_item):
                         output_parts.append({'type': 'input_image', 'image_url': file_item['url']})
 
             result_item = {
@@ -6148,10 +6157,17 @@ async def streaming_chat_response_handler(response, ctx):
                             if file_item.get('type') == 'image' and file_item.get('url', '').startswith('data:'):
                                 # LLM-only: add as input_image part, not frontend display output.
                                 image_url = await store_tool_result_image(request, file_item['url'], metadata, user)
-                                output_parts.append({'type': 'input_image', 'image_url': image_url})
+                                if is_model_viewable_image(file_item):
+                                    output_parts.append({'type': 'input_image', 'image_url': image_url})
+                                else:
+                                    display_files.append({**file_item, 'url': image_url})
                             else:
                                 display_files.append(file_item)
-                                if file_item.get('type') == 'image' and file_item.get('url'):
+                                if (
+                                    file_item.get('type') == 'image'
+                                    and file_item.get('url')
+                                    and is_model_viewable_image(file_item)
+                                ):
                                     output_parts.append({'type': 'input_image', 'image_url': file_item['url']})
 
                         output.append(
