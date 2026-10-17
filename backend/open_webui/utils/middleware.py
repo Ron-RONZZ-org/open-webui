@@ -109,6 +109,7 @@ from open_webui.utils.misc import (
     add_or_update_system_message,
     add_or_update_user_message,
     convert_output_to_messages,
+    data_uri_media_type,
     extract_urls,
     get_content_from_message,
     get_last_assistant_message,
@@ -1059,20 +1060,115 @@ async def apply_source_context_to_messages(
 
 BASE64_IMAGE_DATA_URI_RE = re.compile(r'data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/]+={0,2}', re.IGNORECASE)
 
+# An SVG is XML, so a model that cannot receive it as an image part can still
+# read it as text. Size the inline copy against the model's context window: a
+# share of the remaining context when the last response's usage is known, else
+# a share of the whole window. The file itself stays available for a downstream
+# tool, so truncation loses nothing but the convenience of reading it inline.
+INLINE_SVG_CONTEXT_SHARE = 0.30
+INLINE_SVG_MAX_CONTEXT_SHARE = 0.15
+INLINE_SVG_MIN_CHARS = 10_000
+INLINE_SVG_MAX_CHARS = 200_000
+INLINE_SVG_CHARS_PER_TOKEN = 3  # conservative for XML markup
+DEFAULT_INLINE_SVG_SOURCE_CHARS = 20_000  # when the model exposes no context window
 
-def extract_base64_images(value: Any, files: list) -> Any:
+
+def resolve_model_context_window(models, model) -> int | None:
+    """Return the model's context window, following a custom model's base model."""
+    if not isinstance(models, dict):
+        return None
+
+    candidates = [model or {}]
+    base_model_id = (model or {}).get('info', {}).get('base_model_id')
+    if base_model_id:
+        candidates.append(models.get(base_model_id))
+
+    for candidate in candidates:
+        window = candidate.get('context_window')
+        if isinstance(window, int) and window > 0:
+            return window
+    return None
+
+
+def resolve_inline_svg_char_budget(models, model, usage=None) -> int:
+    """Choose how much SVG source may be inlined, relative to the model's context.
+
+    30% of the context still free after the last response when its usage is known,
+    else 15% of the whole window. Clamped to [10k, 200k] chars; the provider's
+    usage is an estimate, so the clamp also bounds a bad reading.
+    """
+    context_window = resolve_model_context_window(models, model)
+    if context_window is None:
+        return DEFAULT_INLINE_SVG_SOURCE_CHARS
+
+    used_tokens = usage.get('prompt_tokens') if isinstance(usage, dict) else None
+    if isinstance(used_tokens, int) and used_tokens >= 0:
+        budget_tokens = max(0, context_window - used_tokens) * INLINE_SVG_CONTEXT_SHARE
+    else:
+        budget_tokens = context_window * INLINE_SVG_MAX_CONTEXT_SHARE
+
+    return int(
+        max(
+            INLINE_SVG_MIN_CHARS,
+            min(INLINE_SVG_MAX_CHARS, budget_tokens * INLINE_SVG_CHARS_PER_TOKEN),
+        )
+    )
+
+
+def resolve_request_inline_svg_char_budget(request, model, usage=None) -> int:
+    models = getattr(getattr(request, 'app', None), 'state', None)
+    models = getattr(models, 'MODELS', {}) if models is not None else {}
+    return resolve_inline_svg_char_budget(models, model, usage)
+
+
+def _is_svg_mime_type(content_type: str | None) -> bool:
+    return (content_type or '').split(';')[0].strip().lower() == 'image/svg+xml'
+
+
+def _data_uri_base64_payload(data_uri: str) -> str:
+    _, separator, payload = data_uri.partition(';base64,')
+    return payload if separator else ''
+
+
+def inline_svg_source(
+    base64_data: str,
+    char_budget: int = DEFAULT_INLINE_SVG_SOURCE_CHARS,
+) -> str:
+    """Render an SVG image as text the model can read in place of an image input."""
+    try:
+        source = base64.b64decode(base64_data).decode('utf-8')
+    except ValueError as e:
+        log.warning('Could not decode SVG source: %s', e)
+        return '[SVG source unavailable: the image data could not be decoded]'
+
+    truncated = ''
+    if len(source) > char_budget:
+        omitted = len(source) - char_budget
+        source = source[:char_budget]
+        truncated = f'\n… [truncated: {omitted} characters omitted]'
+
+    return f'[SVG source — image/svg+xml cannot be sent as a model image input]\n```xml\n{source}{truncated}\n```'
+
+
+def extract_base64_images(
+    value: Any,
+    files: list,
+    char_budget: int = DEFAULT_INLINE_SVG_SOURCE_CHARS,
+) -> Any:
     """Move base64 image data URIs out of a tool result so they do not reach the model as text."""
     if isinstance(value, str):
         if BASE64_IMAGE_DATA_URI_RE.fullmatch(value):
             files.append({'type': 'image', 'url': value})
+            if _is_svg_mime_type(data_uri_media_type(value)):
+                return inline_svg_source(_data_uri_base64_payload(value), char_budget)
             return '[image]'
         return value
     if isinstance(value, dict):
-        return {key: extract_base64_images(item, files) for key, item in value.items()}
+        return {key: extract_base64_images(item, files, char_budget) for key, item in value.items()}
     if isinstance(value, list):
-        return [extract_base64_images(item, files) for item in value]
+        return [extract_base64_images(item, files, char_budget) for item in value]
     if isinstance(value, tuple):
-        return tuple(extract_base64_images(item, files) for item in value)
+        return tuple(extract_base64_images(item, files, char_budget) for item in value)
     return value
 
 
@@ -1107,8 +1203,10 @@ async def process_tool_result(
     direct_tool=False,
     metadata=None,
     user=None,
+    inline_svg_char_budget=None,
 ):
     tool_result_embeds = []
+    svg_char_budget = inline_svg_char_budget or DEFAULT_INLINE_SVG_SOURCE_CHARS
     EXTERNAL_TOOL_TYPES = ('external', 'action', 'terminal')
 
     # Support (HTMLResponse, result_context) tuples: the optional second
@@ -1222,11 +1320,25 @@ async def process_tool_result(
     # tool_result_files and replace tool_result with a text summary.
     if isinstance(tool_result, str) and tool_result.startswith('data:image/'):
         tool_result_files.append({'type': 'image', 'url': tool_result})
-        tool_result = f'{tool_function_name}: Image file read successfully.'
+        if _is_svg_mime_type(data_uri_media_type(tool_result)):
+            tool_result = inline_svg_source(
+                _data_uri_base64_payload(tool_result),
+                svg_char_budget,
+            )
+        else:
+            tool_result = f'{tool_function_name}: Image file read successfully.'
 
     if isinstance(tool_result, list):
         if tool_type == 'mcp':  # MCP
             tool_response = []
+            svg_items = [
+                item
+                for item in tool_result
+                if isinstance(item, dict) and item.get('type') == 'image' and _is_svg_mime_type(item.get('mimeType'))
+            ]
+            # Share one budget across the SVGs of this result, so N images cannot
+            # each claim the whole per-image allowance.
+            per_svg_budget = max(INLINE_SVG_MIN_CHARS, svg_char_budget // max(1, len(svg_items)))
             for item in tool_result:
                 if isinstance(item, dict):
                     if item.get('type') == 'text':
@@ -1239,9 +1351,10 @@ async def process_tool_result(
                         tool_response.append(text)
                     elif item.get('type') in ['image', 'audio']:
                         mime_type = item.get('mimeType')
+                        data = item.get('data', item.get('blob', ''))
                         file_url = await get_file_url_from_base64(
                             request,
-                            f'data:{mime_type};base64,{item.get("data", item.get("blob", ""))}',
+                            f'data:{mime_type};base64,{data}',
                             {
                                 'chat_id': metadata.get('chat_id', None),
                                 'message_id': metadata.get('message_id', None),
@@ -1257,6 +1370,8 @@ async def process_tool_result(
                                 'content_type': mime_type,
                             }
                         )
+                        if item.get('type') == 'image' and _is_svg_mime_type(mime_type):
+                            tool_response.append(inline_svg_source(data, per_svg_budget))
                     elif item.get('type') == 'resource':
                         resource = item.get('resource', {})
                         text = resource.get('text', '')
@@ -1277,6 +1392,8 @@ async def process_tool_result(
                                         'content_type': resource_mime_type,
                                     }
                                 )
+                                if _is_svg_mime_type(resource_mime_type):
+                                    tool_response.append(inline_svg_source(resource_blob, svg_char_budget))
                             else:
                                 resource_uri = resource.get('uri', 'resource')
                                 tool_response.append(
@@ -1297,7 +1414,7 @@ async def process_tool_result(
                     )
                     tool_result.remove(item)
 
-    tool_result = extract_base64_images(tool_result, tool_result_files)
+    tool_result = extract_base64_images(tool_result, tool_result_files, svg_char_budget)
 
     if isinstance(tool_result, list):
         tool_result = {'results': tool_result}
@@ -1517,6 +1634,10 @@ async def chat_completion_tools_handler(
                 except Exception as e:
                     tool_result = {'error': str(e)}
 
+                inline_svg_char_budget = resolve_inline_svg_char_budget(
+                    models,
+                    models.get(body.get('model')) if isinstance(models, dict) else None,
+                )
                 tool_result, tool_result_files, tool_result_embeds = await process_tool_result(
                     request,
                     tool_function_name,
@@ -1525,6 +1646,7 @@ async def chat_completion_tools_handler(
                     direct_tool,
                     metadata,
                     user,
+                    inline_svg_char_budget=inline_svg_char_budget,
                 )
 
                 if event_emitter:
@@ -3526,6 +3648,12 @@ async def resume_tool_calls(request, form_data, user, model, metadata, message) 
     if not isinstance(output, list):
         return False
 
+    inline_svg_char_budget = resolve_request_inline_svg_char_budget(
+        request,
+        model,
+        message.get('usage'),
+    )
+
     event_emitter, event_caller = await get_event_emitter_and_caller(metadata)
 
     # Request filters must be able to reject the complete request before tool side effects.
@@ -3618,7 +3746,14 @@ async def resume_tool_calls(request, form_data, user, model, metadata, message) 
                 if terminal_file_result:
                     result = terminal_file_result
                 result, files, embeds = await process_tool_result(
-                    request, name, result, tool_type, direct_tool, metadata, user
+                    request,
+                    name,
+                    result,
+                    tool_type,
+                    direct_tool,
+                    metadata,
+                    user,
+                    inline_svg_char_budget=inline_svg_char_budget,
                 )
                 await terminal_event_handler(name, params, result, event_emitter)
             content = tool_result_content(result)
@@ -6042,6 +6177,11 @@ async def streaming_chat_response_handler(response, ctx):
 
                     await emit_output()
 
+                    inline_svg_char_budget = resolve_request_inline_svg_char_budget(
+                        request,
+                        model,
+                        usage,
+                    )
                     results = []
 
                     delegate_calls = [
@@ -6101,6 +6241,7 @@ async def streaming_chat_response_handler(response, ctx):
                             direct_tool,
                             metadata,
                             user,
+                            inline_svg_char_budget=inline_svg_char_budget,
                         )
 
                         await terminal_event_handler(
