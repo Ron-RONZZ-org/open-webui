@@ -27,6 +27,8 @@ COPY package.json package-lock.json ./
 RUN npm ci --force
 
 COPY . .
+# Vite's production build needs more than node's default heap on arm64.
+ENV NODE_OPTIONS=--max-old-space-size=8192
 RUN npm run build
 
 ######## Runtime ########
