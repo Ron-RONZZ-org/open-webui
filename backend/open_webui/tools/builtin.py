@@ -8,6 +8,7 @@ IMPORTANT: DO NOT IMPORT THIS MODULE DIRECTLY IN OTHER PARTS OF THE CODEBASE.
 
 import asyncio
 import logging
+import os
 import time
 from typing import Literal, Optional
 from urllib.parse import unquote
@@ -651,8 +652,178 @@ def _image_output_file(file_item, image_url: str) -> dict:
     }
 
 
+MAX_STAGED_FILES = 10
+MAX_STAGED_TOTAL_BYTES = 25 * 1024 * 1024
+
+
+def _jupyter_upload_dir() -> str:
+    return os.path.abspath(os.environ.get('OPEN_WEBUI_UPLOAD_DIR', '/tmp/open-webui-uploads'))
+
+
+def _read_jupyter_files(paths: list[str]) -> list[dict]:
+    """Read files the Jupyter kernel wrote when it shares a filesystem with this backend."""
+    import base64
+
+    root = os.path.realpath(_jupyter_upload_dir())
+    entries: list[dict] = []
+
+    for raw_path in paths[:MAX_STAGED_FILES]:
+        raw = str(raw_path or '').strip()
+        if not raw:
+            entries.append({'path': raw, 'error': 'empty path'})
+            continue
+
+        candidate = raw if os.path.isabs(raw) else os.path.join(root, raw)
+        resolved = os.path.realpath(candidate)
+        if resolved != root and not resolved.startswith(root + os.sep):
+            entries.append({'path': raw, 'error': f'write the file under {root}'})
+            continue
+
+        name = os.path.basename(resolved)
+        try:
+            with open(resolved, 'rb') as handle:
+                data = handle.read(MAX_STAGED_TOTAL_BYTES + 1)
+        except OSError as err:
+            entries.append({'path': raw, 'name': name, 'error': str(err)})
+            continue
+
+        if len(data) > MAX_STAGED_TOTAL_BYTES:
+            entries.append({'path': raw, 'name': name, 'error': 'file exceeds the save size limit'})
+            continue
+
+        entries.append(
+            {
+                'path': raw,
+                'name': name,
+                'data_base64': base64.b64encode(data).decode('ascii'),
+            }
+        )
+
+    if len(paths) > MAX_STAGED_FILES:
+        entries.append({'path': '', 'error': f'only the first {MAX_STAGED_FILES} paths were read'})
+
+    return entries
+
+
+async def _persist_staged_file(request: Request, data: bytes, name: str, metadata: dict, user) -> dict:
+    """Store one staged interpreter file as a chat file and return its tool record."""
+    import io
+    import mimetypes
+
+    from fastapi import UploadFile
+
+    from open_webui.routers.files import upload_file_handler
+
+    content_type = mimetypes.guess_type(name)[0] or 'application/octet-stream'
+    upload = UploadFile(
+        file=io.BytesIO(data),
+        filename=name,
+        headers={'content-type': content_type},
+    )
+    file_item = await upload_file_handler(
+        request,
+        file=upload,
+        metadata=metadata or {},
+        process=False,
+        user=user,
+    )
+    url = request.app.url_path_for('get_file_content_by_id', id=file_item.id)
+    return {
+        'type': 'image' if content_type.startswith('image/') else 'file',
+        'id': file_item.id,
+        'url': url,
+        'name': (file_item.meta or {}).get('name') or file_item.filename,
+        'path': file_item.path,
+        'content_type': content_type,
+    }
+
+
+async def _persist_staged_files(
+    request: Request, entries: list[dict], metadata: dict, user
+) -> tuple[list[dict], list[str]]:
+    """Persist the interpreter's ``files_to_save`` payload.
+
+    Each entry is ``{path, name, size?, data_base64}`` or ``{path, error}``. Per-file
+    failures are reported as warnings so the model can correct the call without losing
+    the code execution result.
+    """
+    import base64
+
+    max_size_mb = await Config.get('rag.file.max_size')
+    try:
+        max_bytes = int(float(max_size_mb) * 1024 * 1024) if max_size_mb else None
+    except (TypeError, ValueError):
+        max_bytes = None
+
+    persisted: list[dict] = []
+    warnings: list[str] = []
+    total_bytes = 0
+
+    if not isinstance(entries, list):
+        return [], ['The interpreter returned file data in an unexpected format.']
+
+    for entry in entries[:MAX_STAGED_FILES]:
+        if not isinstance(entry, dict):
+            warnings.append('A file was skipped because its record was malformed.')
+            continue
+        name = os.path.basename(str(entry.get('name') or entry.get('path') or ''))
+        path = str(entry.get('path') or name)
+
+        if not name:
+            warnings.append('A file was skipped because it had no name.')
+            continue
+        if entry.get('error'):
+            warnings.append(f'{path}: {entry["error"]}')
+            continue
+
+        encoded = entry.get('data_base64')
+        if not encoded:
+            warnings.append(f'{path}: no file data was returned.')
+            continue
+
+        try:
+            data = base64.b64decode(encoded, validate=True)
+        except (ValueError, TypeError) as err:
+            warnings.append(f'{path}: could not decode the file data ({err}).')
+            continue
+
+        if max_bytes is not None and len(data) > max_bytes:
+            warnings.append(f'{path}: {len(data)} bytes exceeds the {max_size_mb} MB file limit.')
+            continue
+        if total_bytes + len(data) > MAX_STAGED_TOTAL_BYTES:
+            warnings.append(f'{path}: skipped because the total save size exceeded the limit.')
+            continue
+        total_bytes += len(data)
+
+        try:
+            persisted.append(await _persist_staged_file(request, data, name, metadata, user))
+        except Exception as err:
+            log.warning('Failed to persist staged file %s: %s', path, err)
+            warnings.append(f'{path}: could not be saved ({err}).')
+
+    if len(entries) > MAX_STAGED_FILES:
+        warnings.append(f'Only the first {MAX_STAGED_FILES} files were saved.')
+
+    return persisted, warnings
+
+
+async def _attach_staged_files(files: list[dict], chat_id: str, message_id: str, event_emitter) -> None:
+    """Link staged files to the chat message and push them to the open UI."""
+    if not files:
+        return
+
+    if is_saved_chat_id(chat_id) and message_id:
+        db_files = await Chats.add_message_files_by_id_and_message_id(chat_id, message_id, files)
+        if db_files is not None:
+            files = db_files
+
+    if event_emitter:
+        await event_emitter({'type': 'chat:message:files', 'data': {'files': files}})
+
+
 async def execute_code(
     code: str,
+    files_to_save: Optional[list[str]] = None,
     __request__: Request = None,
     __user__: dict = None,
     __event_emitter__: callable = None,
@@ -662,16 +833,31 @@ async def execute_code(
     __metadata__: dict = None,
 ) -> str:
     """
-    Execute Python code in a sandboxed environment and return the output.
-    Use this to perform calculations, data analysis, generate visualizations,
-    or run any Python code that would help answer the user's question.
+    Execute Python code in the code interpreter and return its text output plus any files you list in files_to_save.
 
-    :param code: The Python code to execute
-    :return: JSON with stdout, stderr, result, and files. Images the code prints as
-        ``data:image/...;base64,`` data URIs are uploaded and listed under ``files``
-        (``id``, ``url``, ``name``, ``path``); ``path`` is the file on the server — pass
-        it to a file-upload tool (e.g. the wiki writer's ``upload-file``) to deliver the
-        file. The bytes are already stored, so do not re-send or re-encode them.
+    The interpreter has its own filesystem, separate from the chat's files. Write a file
+    you want to keep under UPLOAD_DIR (the interpreter's upload folder), for example:
+
+        from pathlib import Path
+        path = Path(UPLOAD_DIR) / "chart.svg"
+        path.write_text(svg)
+        print(path)
+
+    A file written there is not available to the user or to other tools until you pass its
+    path in files_to_save. The server copies each listed file into the chat and adds a
+    record to files[]:
+
+      - name: the file name
+      - path: the file on the server — pass this path to a file-upload tool
+      - url: the chat file URL — the user can open or preview the file here
+
+    Only files listed in files_to_save are copied.
+
+    :param code: The Python code to execute.
+    :param files_to_save: Paths of files your code wrote under UPLOAD_DIR, for example
+        ["/mnt/uploads/chart.svg"]. Each listed file is copied into the chat and its
+        server path is returned in files[].path. Use that path with a file-upload tool.
+        Leave this out when the code writes no file you want to keep.
     """
     from uuid import uuid4
 
@@ -711,6 +897,8 @@ async def execute_code(
             code = blocking_code + '\n' + code
 
         engine = await Config.get('code_interpreter.engine', 'pyodide')
+        staged_entries: list[dict] = []
+        staged_warnings: list[str] = []
         if engine == 'pyodide':
             # Execute via frontend pyodide using bidirectional event call
             if __event_call__ is None:
@@ -726,6 +914,7 @@ async def execute_code(
                         'code': code,
                         'session_id': (__metadata__.get('session_id') if __metadata__ else None),
                         'files': (__metadata__.get('files', []) if __metadata__ else []),
+                        'files_to_save': files_to_save or [],
                     },
                 }
             )
@@ -751,6 +940,16 @@ async def execute_code(
 
             jupyter_auth = await Config.get('code_interpreter.jupyter.auth')
 
+            # The interpreter exposes the same UPLOAD_DIR contract as Pyodide. The
+            # backend reads the listed paths from the shared directory; a remote
+            # Jupyter without that mount reports a per-file error instead of silently
+            # returning no files.
+            code = (
+                'import os\n'
+                'UPLOAD_DIR = os.path.abspath(os.environ.get("OPEN_WEBUI_UPLOAD_DIR", "/tmp/open-webui-uploads"))\n'
+                'os.makedirs(UPLOAD_DIR, exist_ok=True)\n'
+            ) + code
+
             output = await execute_code_jupyter(
                 await Config.get('code_interpreter.jupyter.url'),
                 code,
@@ -769,6 +968,7 @@ async def execute_code(
         # Handle image outputs (base64 encoded) - replace with uploaded URLs
         # Get actual user object for image upload (upload_image requires user.id attribute)
         output_files = []
+        user = None
         if __user__ and __user__.get('id'):
             from open_webui.models.users import Users
             from open_webui.utils.files import (
@@ -812,19 +1012,56 @@ async def execute_code(
                                 output_files.append(_image_output_file(file_item, image_url))
                 result = '\n'.join(result_lines)
 
+        # Stage files the interpreter reported as requested by the model.
+        if engine == 'pyodide' and isinstance(output, dict):
+            staged_entries = output.get('saved_files') or []
+        elif engine == 'jupyter' and files_to_save:
+            staged_entries = _read_jupyter_files(files_to_save)
+
+        staged_files: list[dict] = []
+        if staged_entries and user is not None:
+            staged_files, warnings = await _persist_staged_files(
+                __request__,
+                staged_entries,
+                __metadata__ or {},
+                user,
+            )
+            output_files.extend(staged_files)
+            staged_warnings.extend(warnings)
+            try:
+                await _attach_staged_files(staged_files, __chat_id__, __message_id__, __event_emitter__)
+            except Exception as err:
+                log.warning('Failed to attach staged files to the chat: %s', err)
+                staged_warnings.append('The files were saved but could not be attached to the chat.')
+        elif files_to_save and user is None:
+            staged_warnings.append('Files could not be saved because the user context is unavailable.')
+        elif files_to_save and not staged_entries and engine == 'pyodide':
+            staged_warnings.append(
+                'The interpreter did not return the requested files. Write each file under '
+                'UPLOAD_DIR and pass its path in files_to_save.'
+            )
+
         response = {
             'status': 'success',
             'stdout': stdout,
             'stderr': stderr,
             'result': result,
         }
-        if output_files:
-            response['files'] = output_files
-            response['files_note'] = (
-                'Images in files[] are already uploaded; each path is the file on the '
-                'server. To deliver a file (e.g. upload a chart to a wiki), pass its path '
-                'to a file-upload tool — do not re-encode or re-send the bytes.'
-            )
+        if output_files or staged_warnings:
+            if output_files:
+                response['files'] = output_files
+            note = ''
+            if staged_files:
+                note = 'The staged files are attached to this chat and visible to the user. '
+            if output_files:
+                note += (
+                    'Each path in files[] is the file on the server; pass it to a file-upload '
+                    'tool — do not re-encode or re-send the bytes.'
+                )
+            if staged_warnings:
+                note = (note + ' ' + ' '.join(staged_warnings)).strip()
+            if note:
+                response['files_note'] = note
 
         return JSONCodec.dumps(response, ensure_ascii=False)
     except Exception as e:

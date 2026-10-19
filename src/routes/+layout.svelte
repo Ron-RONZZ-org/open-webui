@@ -305,7 +305,7 @@
 		return worker;
 	};
 
-	const executePythonAsWorker = async (id, code, cb, files = []) => {
+	const executePythonAsWorker = async (id, code, cb, files = [], filesToSave = []) => {
 		let result = null;
 		let stdout = null;
 		let stderr = null;
@@ -357,7 +357,8 @@
 			id: id,
 			code: code,
 			packages: packages,
-			files: filePayloads.length > 0 ? filePayloads : undefined
+			files: filePayloads.length > 0 ? filePayloads : undefined,
+			files_to_save: filesToSave.length > 0 ? filesToSave : undefined
 		});
 
 		// Timeout for this specific execution (not the worker itself)
@@ -377,7 +378,8 @@
 								{
 									stdout: stdout,
 									stderr: stderr,
-									result: result
+									result: result,
+									saved_files: []
 								},
 								(_key, value) => (typeof value === 'bigint' ? value.toString() : value)
 							)
@@ -411,14 +413,14 @@
 							{
 								stdout: stdout,
 								stderr: stderr,
-								result: result
+								result: result,
+								saved_files: data.saved_files ?? []
 							},
 							(_key, value) => (typeof value === 'bigint' ? value.toString() : value)
 						)
 					)
 				);
 			}
-
 			executing = false;
 		};
 
@@ -435,7 +437,8 @@
 							{
 								stdout: stdout,
 								stderr: stderr,
-								result: result
+								result: result,
+								saved_files: []
 							},
 							(_key, value) => (typeof value === 'bigint' ? value.toString() : value)
 						)
@@ -659,7 +662,7 @@
 		if (data?.session_id === $socket.id) {
 			if (type === 'execute:python') {
 				console.log('execute:python', data);
-				executePythonAsWorker(data.id, data.code, cb, data.files || []);
+				executePythonAsWorker(data.id, data.code, cb, data.files || [], data.files_to_save || []);
 				return;
 			} else if (type === 'execute:tool') {
 				console.log('execute:tool', data);

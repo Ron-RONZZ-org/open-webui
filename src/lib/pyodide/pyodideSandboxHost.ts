@@ -8,6 +8,10 @@ const sandboxScript = String.raw`
 	let pyodideReady = null;
 	let stdout = null;
 	let stderr = null;
+	const UPLOAD_DIR = '/mnt/uploads';
+	const MAX_SAVED_FILES = 10;
+	const MAX_SAVED_FILE_BYTES = 20 * 1024 * 1024;
+	const MAX_SAVED_TOTAL_BYTES = 25 * 1024 * 1024;
 
 	function post(message, transfer) {
 		parent.postMessage(message, '*', transfer || []);
@@ -26,7 +30,8 @@ const sandboxScript = String.raw`
 			},
 			packages: ['micropip']
 		});
-		pyodide.FS.mkdirTree('/mnt/uploads');
+		pyodide.FS.mkdirTree(UPLOAD_DIR);
+		pyodide.globals.set('UPLOAD_DIR', UPLOAD_DIR);
 		await pyodide.pyimport('micropip').install(packages || []);
 	}
 
@@ -128,7 +133,68 @@ const sandboxScript = String.raw`
 		].join('\n'));
 	}
 
-	async function execute(id, code, files) {
+	function toBase64(data) {
+		let binary = '';
+		const chunkSize = 0x8000;
+		for (let i = 0; i < data.length; i += chunkSize) {
+			binary += String.fromCharCode.apply(null, data.subarray(i, i + chunkSize));
+		}
+		return btoa(binary);
+	}
+
+	function readFilesToSave(paths) {
+		const saved = [];
+		let totalBytes = 0;
+		for (const rawPath of paths.slice(0, MAX_SAVED_FILES)) {
+			const path = String(rawPath == null ? '' : rawPath).trim();
+			const name = path.split('/').pop() || '';
+
+			if (!path || !name) {
+				saved.push({ path: path, error: 'empty path' });
+				continue;
+			}
+			if (path !== UPLOAD_DIR && path.indexOf(UPLOAD_DIR + '/') !== 0) {
+				saved.push({ path: path, name: name, error: 'write the file under ' + UPLOAD_DIR });
+				continue;
+			}
+
+			try {
+				const stat = pyodide.FS.stat(path);
+				if (pyodide.FS.isDir(stat.mode)) {
+					saved.push({ path: path, name: name, error: 'path is a directory' });
+					continue;
+				}
+				if (stat.size > MAX_SAVED_FILE_BYTES) {
+					saved.push({
+						path: path,
+						name: name,
+						error: stat.size + ' bytes exceeds the ' + MAX_SAVED_FILE_BYTES + '-byte save limit'
+					});
+					continue;
+				}
+				const data = pyodide.FS.readFile(path);
+				if (totalBytes + data.length > MAX_SAVED_TOTAL_BYTES) {
+					saved.push({ path: path, name: name, error: 'skipped because the total save size exceeded the limit' });
+					continue;
+				}
+				totalBytes += data.length;
+				saved.push({ path: path, name: name, size: data.length, data_base64: toBase64(data) });
+			} catch (error) {
+				saved.push({
+					path: path,
+					name: name,
+					error: error && error.message ? error.message : String(error)
+				});
+			}
+		}
+
+		if (paths.length > MAX_SAVED_FILES) {
+			saved.push({ path: '', error: 'only the first ' + MAX_SAVED_FILES + ' paths were read' });
+		}
+		return saved;
+	}
+
+	async function execute(id, code, files, filesToSave) {
 		stdout = null;
 		stderr = null;
 		let result = null;
@@ -139,7 +205,8 @@ const sandboxScript = String.raw`
 		} catch (error) {
 			stderr = error && error.message ? error.message : String(error);
 		}
-		post({ id: id, result: result, stdout: stdout, stderr: stderr });
+		const savedFiles = filesToSave && filesToSave.length > 0 ? readFilesToSave(filesToSave) : [];
+		post({ id: id, result: result, stdout: stdout, stderr: stderr, saved_files: savedFiles });
 	}
 
 	window.addEventListener('message', async function (event) {
@@ -149,7 +216,7 @@ const sandboxScript = String.raw`
 		try {
 			if (!data.type || data.type === 'execute') {
 				await ensureRuntime(data.packages || []);
-				await execute(id, data.code, data.files);
+				await execute(id, data.code, data.files, data.files_to_save);
 				return;
 			}
 			await ensureRuntime();
