@@ -38,6 +38,7 @@ export type OutputDetailToken = {
 		duration?: string;
 		arguments?: string;
 		files?: string;
+		filesNote?: string;
 		embeds?: string;
 		output?: string;
 		status?: string;
@@ -165,6 +166,19 @@ function parseJSONStringValue(value: unknown): unknown {
 	return parsed;
 }
 
+// Tool results are JSON encoded in a text part. Tools such as execute_code put
+// their staged-file metadata (files/files_note) inside that JSON rather than on
+// the output item itself, so the renderer has to unwrap it to surface the paths.
+function getStructuredToolResult(resultItem?: OutputItem): Record<string, unknown> | null {
+	if (!resultItem) {
+		return null;
+	}
+	const parsed = parseJSONStringValue(getToolResultText(resultItem));
+	return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+		? (parsed as Record<string, unknown>)
+		: null;
+}
+
 function getInlineFileFromToolOutput(callItem?: OutputItem, resultItem?: OutputItem) {
 	if (!callItem || !resultItem || callItem.name !== 'display_file') {
 		return null;
@@ -196,6 +210,10 @@ function getInlineFileFromToolOutput(callItem?: OutputItem, resultItem?: OutputI
 function buildToolCallToken(item: OutputItem, toolOutputByCallId: Record<string, OutputItem>) {
 	const callId = item.call_id ?? item.id ?? '';
 	const resultItem = toolOutputByCallId[callId];
+	const structuredResult = getStructuredToolResult(resultItem);
+	const resultFiles = structuredResult?.files ?? resultItem?.files;
+	const filesNote =
+		typeof structuredResult?.files_note === 'string' ? structuredResult.files_note : '';
 	const status = String(item.status ?? '');
 	const isPending = status === 'pending';
 	const isDone = !!resultItem || status === 'failed' || status === 'incomplete';
@@ -232,7 +250,8 @@ function buildToolCallToken(item: OutputItem, toolOutputByCallId: Record<string,
 			status,
 			// ToolCallDisplay HTML-decodes these, like legacy <details> attributes.
 			arguments: encode(stringifyAttribute(item.arguments ?? '')),
-			files: encode(stringifyAttribute(resultItem?.files)),
+			files: encode(stringifyAttribute(resultFiles)),
+			...(filesNote ? { filesNote: encode(filesNote) } : {}),
 			embeds: encode(stringifyAttribute(resultItem?.embeds))
 		}
 	};
