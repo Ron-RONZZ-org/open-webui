@@ -35,6 +35,19 @@ jobs:
         working-directory: backend
         run: ruff check --select=F --ignore=F401,F403,F405,F541,F811,F841 --output-format=github .
 
+  frontend-unit:
+    name: Frontend unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+      - name: Install dependencies
+        run: npm ci --force
+      - name: Vitest
+        run: npm run test:frontend
+
   regression:
     name: Regression (fast)
     uses: Ron-RONZZ-org/open-webui-tests/.github/workflows/regression.yml@main
@@ -78,7 +91,7 @@ jobs:
 
   publish:
     name: Publish image
-    needs: [lint, regression, image]
+    needs: [lint, regression, image, frontend-unit]
     if: github.event_name == 'push' && github.ref == 'refs/heads/ronzz/artifact-pipeline'
     runs-on: ubuntu-24.04-arm
     permissions:

@@ -19,6 +19,7 @@
 	import Image from './Image.svelte';
 	import FullHeightIframe from './FullHeightIframe.svelte';
 	import { settings } from '$lib/stores';
+	import { safeLinkUrl } from '$lib/utils';
 
 	export let id: string = '';
 	export let attributes: {
@@ -28,6 +29,7 @@
 		arguments?: string;
 		result?: string;
 		files?: string;
+		filesNote?: string;
 		embeds?: string;
 		done?: string;
 		status?: string;
@@ -91,6 +93,14 @@
 		}
 	}
 
+	function isStagedFile(file: unknown): file is Record<string, unknown> {
+		if (!file || typeof file !== 'object' || Array.isArray(file)) {
+			return false;
+		}
+		const record = file as Record<string, unknown>;
+		return typeof record.path === 'string' || typeof record.url === 'string';
+	}
+
 	function isToolResultError(value: unknown): boolean {
 		if (typeof value === 'string') {
 			const text = value.trim().toLowerCase();
@@ -138,6 +148,8 @@
 
 	$: result = resultContent || decode(attributes?.result ?? '');
 	$: files = parseJSONString(decode(attributes?.files ?? ''));
+	$: filesNote = decode(attributes?.filesNote ?? '');
+	$: stagedFiles = Array.isArray(files) ? files.filter(isStagedFile).slice(0, 20) : [];
 	$: embeds = parseJSONString(decode(attributes?.embeds ?? ''));
 	$: isAskUser = attributes?.name === 'ask_user';
 	$: needsInput = isAskUser && attributes?.status === 'pending';
@@ -381,5 +393,56 @@
 				{/if}
 			{/each}
 		{/if}
+	{/if}
+
+	<!-- Staged files: server-side paths returned by tools such as execute_code -->
+	{#if isDone && stagedFiles.length > 0}
+		<div
+			class="mt-1.5 rounded-xl border border-gray-50 dark:border-gray-850/30 px-2.5 py-2 space-y-1.5"
+		>
+			<div
+				class="text-[0.625rem] uppercase tracking-wider font-normal text-gray-400 dark:text-gray-500"
+			>
+				{$i18n.t('Staged files')}
+			</div>
+			<ul class="space-y-1">
+				{#each stagedFiles as file, idx}
+					<li class="min-w-0 text-xs text-gray-600 dark:text-gray-300">
+						<div class="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+							{#if typeof file.url === 'string' && file.url}
+								<a
+									class="font-medium underline decoration-gray-300 underline-offset-2 hover:decoration-gray-500 dark:decoration-gray-600 dark:hover:decoration-gray-400"
+									href={safeLinkUrl(String(file.url))}
+									target="_blank"
+									rel="noopener noreferrer"
+								>
+									{file.name ? String(file.name) : String(file.path ?? file.url)}
+								</a>
+							{:else}
+								<span class="font-medium">
+									{file.name ? String(file.name) : String(file.path)}
+								</span>
+							{/if}
+							{#if typeof file.path === 'string' && file.path}
+								<code class="break-all text-[0.6875rem] text-gray-500 dark:text-gray-400">
+									{file.path}
+								</code>
+							{/if}
+						</div>
+					</li>
+				{/each}
+			</ul>
+			{#if stagedFiles.length < files.length}
+				<div class="text-[0.6875rem] text-gray-500 dark:text-gray-400">
+					{$i18n.t('Showing {{COUNT}} of {{TOTAL}} files', {
+						COUNT: stagedFiles.length,
+						TOTAL: files.length
+					})}
+				</div>
+			{/if}
+			{#if filesNote}
+				<div class="text-[0.6875rem] text-gray-500 dark:text-gray-400">{filesNote}</div>
+			{/if}
+		</div>
 	{/if}
 </div>
