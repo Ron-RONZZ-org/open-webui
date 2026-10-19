@@ -17,6 +17,11 @@ declare global {
 // Pyodide bootstrap
 // ---------------------------------------------------------------------------
 
+const UPLOAD_DIR = '/mnt/uploads';
+const MAX_SAVED_FILES = 10;
+const MAX_SAVED_FILE_BYTES = 20 * 1024 * 1024;
+const MAX_SAVED_TOTAL_BYTES = 25 * 1024 * 1024;
+
 let pyodideReady: Promise<void> | null = null;
 
 async function loadPyodideAndPackages(packages: string[] = []) {
@@ -47,9 +52,10 @@ async function loadPyodideAndPackages(packages: string[] = []) {
 	});
 
 	// Create the upload directory and mount IDBFS for persistence
-	const uploadDir = '/mnt/uploads';
+	const uploadDir = UPLOAD_DIR;
 	self.pyodide.FS.mkdirTree(uploadDir);
 	self.pyodide.FS.mount(self.pyodide.FS.filesystems.IDBFS, {}, '/mnt');
+	self.pyodide.globals.set('UPLOAD_DIR', uploadDir);
 
 	// Load persisted files from IndexedDB
 	await new Promise<void>((resolve) => {
@@ -148,6 +154,77 @@ function fsRead(path: string): ArrayBuffer {
 	return data.buffer as ArrayBuffer;
 }
 
+function toBase64(data: Uint8Array): string {
+	let binary = '';
+	const chunkSize = 0x8000;
+	for (let i = 0; i < data.length; i += chunkSize) {
+		binary += String.fromCharCode(...data.subarray(i, i + chunkSize));
+	}
+	return btoa(binary);
+}
+
+function readFilesToSave(
+	paths: string[]
+): { path: string; name?: string; size?: number; data_base64?: string; error?: string }[] {
+	const saved: {
+		path: string;
+		name?: string;
+		size?: number;
+		data_base64?: string;
+		error?: string;
+	}[] = [];
+	let totalBytes = 0;
+
+	for (const rawPath of paths.slice(0, MAX_SAVED_FILES)) {
+		const path = String(rawPath ?? '').trim();
+		const name = path.split('/').pop() ?? '';
+
+		if (!path || !name) {
+			saved.push({ path, error: 'empty path' });
+			continue;
+		}
+		if (path !== UPLOAD_DIR && !path.startsWith(`${UPLOAD_DIR}/`)) {
+			saved.push({ path, name, error: `write the file under ${UPLOAD_DIR}` });
+			continue;
+		}
+
+		try {
+			const stat = self.pyodide.FS.stat(path);
+			if (self.pyodide.FS.isDir(stat.mode)) {
+				saved.push({ path, name, error: 'path is a directory' });
+				continue;
+			}
+			if (stat.size > MAX_SAVED_FILE_BYTES) {
+				saved.push({
+					path,
+					name,
+					error: `${stat.size} bytes exceeds the ${MAX_SAVED_FILE_BYTES}-byte save limit`
+				});
+				continue;
+			}
+			const data = new Uint8Array(fsRead(path));
+			if (totalBytes + data.byteLength > MAX_SAVED_TOTAL_BYTES) {
+				saved.push({ path, name, error: 'skipped because the total save size exceeded the limit' });
+				continue;
+			}
+			totalBytes += data.byteLength;
+			saved.push({ path, name, size: data.byteLength, data_base64: toBase64(data) });
+		} catch (err) {
+			saved.push({
+				path,
+				name,
+				error: err instanceof Error ? err.message : String(err)
+			});
+		}
+	}
+
+	if (paths.length > MAX_SAVED_FILES) {
+		saved.push({ path: '', error: `only the first ${MAX_SAVED_FILES} paths were read` });
+	}
+
+	return saved;
+}
+
 function fsDelete(path: string) {
 	try {
 		const stat = self.pyodide.FS.stat(path);
@@ -177,7 +254,8 @@ function fsMkdir(path: string) {
 async function executeCode(
 	id: string,
 	code: string,
-	files?: { name: string; data: ArrayBuffer }[]
+	files?: { name: string; data: ArrayBuffer }[],
+	filesToSave?: string[]
 ) {
 	self.stdout = null;
 	self.stderr = null;
@@ -232,7 +310,14 @@ matplotlib.pyplot.show = show`);
 		self.stderr = error instanceof Error ? error.message : String(error);
 	}
 
-	self.postMessage({ id, result: self.result, stdout: self.stdout, stderr: self.stderr });
+	const savedFiles = filesToSave && filesToSave.length > 0 ? readFilesToSave(filesToSave) : [];
+	self.postMessage({
+		id,
+		result: self.result,
+		stdout: self.stdout,
+		stderr: self.stderr,
+		saved_files: savedFiles
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -245,7 +330,7 @@ self.onmessage = async (event) => {
 
 	// Backward compatibility: messages without a `type` field are execute requests
 	if (!type || type === 'execute') {
-		const { code, files, ...context } = data;
+		const { code, files, files_to_save, ...context } = data;
 
 		// Copy context keys (packages, etc.) into worker scope
 		for (const key of Object.keys(context)) {
@@ -255,7 +340,7 @@ self.onmessage = async (event) => {
 		}
 
 		await ensurePyodide(self.packages);
-		await executeCode(id, code, files);
+		await executeCode(id, code, files, files_to_save);
 		return;
 	}
 
