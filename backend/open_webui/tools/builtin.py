@@ -738,7 +738,9 @@ async def _persist_staged_file(request: Request, data: bytes, name: str, metadat
     }
 
 
-async def _persist_staged_files(request: Request, entries: list[dict], metadata: dict, user) -> tuple[list[dict], list[str]]:
+async def _persist_staged_files(
+    request: Request, entries: list[dict], metadata: dict, user
+) -> tuple[list[dict], list[str]]:
     """Persist the interpreter's ``files_to_save`` payload.
 
     Each entry is ``{path, name, size?, data_base64}`` or ``{path, error}``. Per-file
