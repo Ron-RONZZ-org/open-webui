@@ -975,17 +975,29 @@ async def execute_code(
 
         elif engine == 'jupyter':
             from open_webui.utils.code_interpreter import execute_code_jupyter
+            from open_webui.utils.interpreter_attachments import stage_attachments
 
             jupyter_auth = await Config.get('code_interpreter.jupyter.auth')
 
-            # The interpreter exposes the same UPLOAD_DIR contract as Pyodide. The
-            # backend reads the listed paths from the shared directory; a remote
-            # Jupyter without that mount reports a per-file error instead of silently
-            # returning no files.
+            # The sandbox is a separate container and cannot read the upload store.
+            # Copy this conversation's attachments into its inbox and pass a
+            # manifest, so generated code sees this chat's files and nothing else.
+            attachments, attachment_warnings = await asyncio.to_thread(
+                stage_attachments,
+                __chat_id__,
+                _collect_interpreter_files(__metadata__ or {}),
+            )
+            staged_warnings.extend(attachment_warnings)
+
+            # The kernel keeps UPLOAD_DIR for files it writes and ATTACHMENTS for
+            # the files the user supplied. The backend reads the listed paths from
+            # the shared directory; a remote Jupyter without that mount reports a
+            # per-file error instead of silently returning no files.
             code = (
                 'import os\n'
                 'UPLOAD_DIR = os.path.abspath(os.environ.get("OPEN_WEBUI_UPLOAD_DIR", "/tmp/open-webui-uploads"))\n'
                 'os.makedirs(UPLOAD_DIR, exist_ok=True)\n'
+                f'ATTACHMENTS = {attachments!r}\n'
             ) + code
 
             output = await execute_code_jupyter(
@@ -994,6 +1006,7 @@ async def execute_code(
                 (await Config.get('code_interpreter.jupyter.auth_token') if jupyter_auth == 'token' else None),
                 (await Config.get('code_interpreter.jupyter.auth_password') if jupyter_auth == 'password' else None),
                 await Config.get('code_interpreter.jupyter.timeout'),
+                session_key=__chat_id__,
             )
 
             stdout = output.get('stdout', '')
