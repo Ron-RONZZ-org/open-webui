@@ -38,7 +38,7 @@ export type OutputDetailToken = {
 		duration?: string;
 		arguments?: string;
 		files?: string;
-		filesNote?: string;
+		filesWarning?: string;
 		embeds?: string;
 		output?: string;
 		status?: string;
@@ -167,7 +167,7 @@ function parseJSONStringValue(value: unknown): unknown {
 }
 
 // Tool results are JSON encoded in a text part. Tools such as execute_code put
-// their staged-file metadata (files/files_note) inside that JSON rather than on
+// their staged-file metadata (files/files_warning) inside that JSON rather than on
 // the output item itself, so the renderer has to unwrap it to surface the paths.
 function getStructuredToolResult(resultItem?: OutputItem): Record<string, unknown> | null {
 	if (!resultItem) {
@@ -207,13 +207,29 @@ function getInlineFileFromToolOutput(callItem?: OutputItem, resultItem?: OutputI
 		: result;
 }
 
+// `files_note` is a model-facing instruction (it tells the tool caller how to pass
+// a staged path). It must not be rendered as user content, including for chats
+// stored before the backend stopped emitting it.
+function hideModelOnlyToolResultFields(text: string): string {
+	const parsed = parseJSONStringValue(text);
+	if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+		return text;
+	}
+	const record = { ...(parsed as Record<string, unknown>) };
+	if (!('files_note' in record)) {
+		return text;
+	}
+	delete record.files_note;
+	return JSON.stringify(record);
+}
+
 function buildToolCallToken(item: OutputItem, toolOutputByCallId: Record<string, OutputItem>) {
 	const callId = item.call_id ?? item.id ?? '';
 	const resultItem = toolOutputByCallId[callId];
 	const structuredResult = getStructuredToolResult(resultItem);
 	const resultFiles = structuredResult?.files ?? resultItem?.files;
-	const filesNote =
-		typeof structuredResult?.files_note === 'string' ? structuredResult.files_note : '';
+	const filesWarning =
+		typeof structuredResult?.files_warning === 'string' ? structuredResult.files_warning : '';
 	const status = String(item.status ?? '');
 	const isPending = status === 'pending';
 	const isDone = !!resultItem || status === 'failed' || status === 'incomplete';
@@ -241,7 +257,7 @@ function buildToolCallToken(item: OutputItem, toolOutputByCallId: Record<string,
 				: isExecuting
 					? 'Executing...'
 					: 'Preparing...',
-		text: getToolResultText(resultItem),
+		text: hideModelOnlyToolResultFields(getToolResultText(resultItem)),
 		attributes: {
 			type: 'tool_calls',
 			id: callId,
@@ -251,7 +267,7 @@ function buildToolCallToken(item: OutputItem, toolOutputByCallId: Record<string,
 			// ToolCallDisplay HTML-decodes these, like legacy <details> attributes.
 			arguments: encode(stringifyAttribute(item.arguments ?? '')),
 			files: encode(stringifyAttribute(resultFiles)),
-			...(filesNote ? { filesNote: encode(filesNote) } : {}),
+			...(filesWarning ? { filesWarning: encode(filesWarning) } : {}),
 			embeds: encode(stringifyAttribute(resultItem?.embeds))
 		}
 	};
