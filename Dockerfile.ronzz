@@ -39,6 +39,9 @@ FROM ghcr.io/open-webui/open-webui:v0.12.0
 COPY --from=frontend /app/build /app/build
 
 COPY backend/open_webui/utils/files.py /app/backend/open_webui/utils/files.py
+COPY backend/open_webui/utils/code_interpreter.py /app/backend/open_webui/utils/code_interpreter.py
+COPY backend/open_webui/utils/kernel_pool.py /app/backend/open_webui/utils/kernel_pool.py
+COPY backend/open_webui/utils/interpreter_attachments.py /app/backend/open_webui/utils/interpreter_attachments.py
 COPY backend/open_webui/utils/middleware.py /app/backend/open_webui/utils/middleware.py
 COPY backend/open_webui/utils/misc.py /app/backend/open_webui/utils/misc.py
 COPY backend/open_webui/tools/builtin.py /app/backend/open_webui/tools/builtin.py
@@ -47,6 +50,9 @@ COPY backend/open_webui/tools/builtin.py /app/backend/open_webui/tools/builtin.p
 # recompiles them instead of importing a stale .pyc that predates the patch.
 RUN rm -f \
       /app/backend/open_webui/utils/__pycache__/files.*.pyc \
+      /app/backend/open_webui/utils/__pycache__/code_interpreter.*.pyc \
+      /app/backend/open_webui/utils/__pycache__/kernel_pool.*.pyc \
+      /app/backend/open_webui/utils/__pycache__/interpreter_attachments.*.pyc \
       /app/backend/open_webui/utils/__pycache__/middleware.*.pyc \
       /app/backend/open_webui/utils/__pycache__/misc.*.pyc \
       /app/backend/open_webui/tools/__pycache__/builtin.*.pyc
