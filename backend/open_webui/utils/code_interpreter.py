@@ -7,9 +7,24 @@ import aiohttp
 import websockets
 from open_webui.env import AIOHTTP_CLIENT_ALLOW_REDIRECTS
 from open_webui.utils.json_codec import JSONCodec
+from open_webui.utils.kernel_pool import KernelPool
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
+
+# Kernels are reused per conversation so that state survives between calls. The
+# map is bounded (LRU) and the Jupyter server culls idle kernels independently;
+# every reuse is verified, so a culled kernel is recreated rather than failing.
+_KERNEL_POOL = KernelPool()
+_SESSION_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _session_lock(key: str) -> asyncio.Lock:
+    lock = _SESSION_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _SESSION_LOCKS[key] = lock
+    return lock
 
 
 class ResultModel(BaseModel):
@@ -34,6 +49,8 @@ class JupyterCodeExecuter:
         token: str = '',
         password: str = '',
         timeout: int = 60,
+        session_key: str | None = None,
+        pool: KernelPool | None = None,
     ):
         """
         :param base_url: Jupyter server URL (e.g., "http://localhost:8888")
@@ -41,13 +58,20 @@ class JupyterCodeExecuter:
         :param token: Jupyter authentication token (optional)
         :param password: Jupyter password (optional)
         :param timeout: WebSocket timeout in seconds (default: 60s)
+        :param session_key: conversation key whose kernel is reused between calls
+        :param pool: kernel cache shared by all calls of this process
         """
         self.base_url = base_url
         self.code = code
         self.token = token
         self.password = password
         self.timeout = timeout
+        self.session_key = session_key
+        self.pool = pool
         self.kernel_id = ''
+        # A kernel that could not be interrupted is left running; deleting it on
+        # exit is the only way to guarantee the next call starts clean.
+        self.kernel_broken = False
         if self.base_url[-1] != '/':
             self.base_url += '/'
         self.session = aiohttp.ClientSession(trust_env=True, base_url=self.base_url)
@@ -58,18 +82,16 @@ class JupyterCodeExecuter:
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.kernel_id:
-            try:
-                async with self.session.delete(f'api/kernels/{self.kernel_id}', params=self.params) as response:
-                    response.raise_for_status()
-            except Exception as err:
-                logger.exception('close kernel failed, %s', err)
+        if self.kernel_id and (self.session_key is None or self.kernel_broken):
+            if self.kernel_broken and self.pool is not None and self.session_key is not None:
+                self.pool.pop(self.session_key)
+            await self.delete_kernel(self.kernel_id)
         await self.session.close()
 
     async def run(self) -> ResultModel:
         try:
             await self.sign_in()
-            await self.init_kernel()
+            await self.ensure_kernel()
             await self.execute_code()
         except Exception as err:
             logger.exception('execute code failed, %s', err)
@@ -103,6 +125,47 @@ class JupyterCodeExecuter:
             response.raise_for_status()
             kernel_data = await response.json()
             self.kernel_id = kernel_data['id']
+
+    async def ensure_kernel(self) -> None:
+        """Reuse this conversation's kernel when it is still alive, else create one."""
+        if self.session_key is not None and self.pool is not None:
+            kernel_id = self.pool.get(self.session_key)
+            if kernel_id is not None and await self.kernel_alive(kernel_id):
+                self.kernel_id = kernel_id
+                return
+            if kernel_id is not None:
+                self.pool.pop(self.session_key)
+
+        await self.init_kernel()
+        if self.session_key is None or self.pool is None:
+            return
+
+        evicted = self.pool.put(self.session_key, self.kernel_id)
+        if evicted is not None:
+            await self.delete_kernel(evicted)
+
+    async def kernel_alive(self, kernel_id: str) -> bool:
+        async with self.session.get(f'api/kernels/{kernel_id}', params=self.params) as response:
+            return response.status == 200
+
+    async def delete_kernel(self, kernel_id: str) -> None:
+        try:
+            async with self.session.delete(f'api/kernels/{kernel_id}', params=self.params) as response:
+                response.raise_for_status()
+        except Exception as err:
+            # Non-fatal: the Jupyter server culls idle kernels on its own. Log it
+            # with the id so a leak is observable instead of silent.
+            logger.warning('could not delete kernel %s: %s', kernel_id, err)
+
+    async def interrupt(self) -> bool:
+        """Stop the running execution without destroying the kernel's state."""
+        try:
+            async with self.session.post(f'api/kernels/{self.kernel_id}/interrupt', params=self.params) as response:
+                response.raise_for_status()
+            return True
+        except Exception as err:
+            logger.warning('could not interrupt kernel %s: %s', self.kernel_id, err)
+            return False
 
     def init_ws(self) -> (str, dict):
         ws_base = self.base_url.replace('http', 'ws', 1)
@@ -183,6 +246,12 @@ class JupyterCodeExecuter:
 
             except asyncio.TimeoutError:
                 stderr += '\nExecution timed out.'
+                # A persistent kernel keeps running the abandoned code, so the
+                # next call in this conversation would queue behind it. Interrupt
+                # it; if that fails, mark it broken and delete it on exit.
+                if not await self.interrupt():
+                    self.kernel_broken = True
+                    stderr += ' The kernel could not be interrupted and will be restarted.'
                 break
         self.result.stdout = stdout.strip()
         self.result.stderr = stderr.strip()
@@ -190,8 +259,34 @@ class JupyterCodeExecuter:
 
 
 async def execute_code_jupyter(
-    base_url: str, code: str, token: str = '', password: str = '', timeout: int = 60
+    base_url: str,
+    code: str,
+    token: str = '',
+    password: str = '',
+    timeout: int = 60,
+    session_key: str | None = None,
 ) -> dict:
-    async with JupyterCodeExecuter(base_url, code, token, password, timeout) as executor:
-        result = await executor.run()
-        return result.model_dump()
+    """Execute code, reusing one kernel per session_key.
+
+    Calls for the same conversation are serialised so two tool calls cannot
+    interleave on one kernel. Without a session_key each call gets its own
+    kernel, which is deleted afterwards.
+    """
+    if session_key is None:
+        async with JupyterCodeExecuter(base_url, code, token, password, timeout) as executor:
+            result = await executor.run()
+            return result.model_dump()
+
+    pool_key = f'{base_url}|{session_key}'
+    async with _session_lock(pool_key):
+        async with JupyterCodeExecuter(
+            base_url,
+            code,
+            token,
+            password,
+            timeout,
+            session_key=pool_key,
+            pool=_KERNEL_POOL,
+        ) as executor:
+            result = await executor.run()
+            return result.model_dump()

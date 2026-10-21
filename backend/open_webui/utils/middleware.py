@@ -6623,6 +6623,7 @@ async def streaming_chat_response_handler(response, ctx):
                                             else None
                                         ),
                                         await Config.get('code_interpreter.jupyter.timeout'),
+                                        session_key=metadata.get('chat_id'),
                                     )
                                 else:
                                     ci_output = {'stdout': 'Code interpreter engine not configured.'}
