@@ -821,6 +821,34 @@ async def _attach_staged_files(files: list[dict], chat_id: str, message_id: str,
         await event_emitter({'type': 'chat:message:files', 'data': {'files': files}})
 
 
+def _collect_interpreter_files(metadata: dict) -> list[dict]:
+    """Return every attachment the code interpreter may need to read.
+
+    ``metadata['files']`` is the retrieval list and deliberately excludes raster
+    images (they are sent to the model as image inputs). The interpreter needs the
+    bytes of every attachment, including images, so merge in the files on the
+    current user message and deduplicate by file id/url/name.
+    """
+    user_message = metadata.get('user_message') or {}
+    merged: list[dict] = []
+    seen: set[str] = set()
+
+    for item in [*(metadata.get('files') or []), *(user_message.get('files') or [])]:
+        if not isinstance(item, dict):
+            continue
+        file_item = item.get('file') if isinstance(item.get('file'), dict) else {}
+        key = str(
+            item.get('id') or file_item.get('id') or item.get('url') or item.get('name') or item.get('filename') or ''
+        )
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        merged.append(item)
+
+    return merged
+
+
 async def execute_code(
     code: str,
     files_to_save: Optional[list[str]] = None,
@@ -913,7 +941,7 @@ async def execute_code(
                         'id': str(uuid4()),
                         'code': code,
                         'session_id': (__metadata__.get('session_id') if __metadata__ else None),
-                        'files': (__metadata__.get('files', []) if __metadata__ else []),
+                        'files': _collect_interpreter_files(__metadata__ or {}),
                         'files_to_save': files_to_save or [],
                     },
                 }
@@ -921,11 +949,21 @@ async def execute_code(
 
             # Parse the output - pyodide returns dict with stdout, stderr, result
             if isinstance(output, dict):
-                # Handle error responses from event_caller (e.g. session disconnected, timeout)
+                # Handle error responses from event_caller (e.g. session disconnected, timeout).
+                # Return a real error: the interpreter is browser-side, so a closed tab or a
+                # lost socket is not retryable. Reporting success with stderr only made the
+                # model retry the same call until the conversation ran out of turns.
                 if output.get('error') and not output.get('stdout') and not output.get('result'):
-                    stderr = output['error']
-                    stdout = ''
-                    result = ''
+                    return JSONCodec.dumps(
+                        {
+                            'status': 'error',
+                            'error': (
+                                f"{output['error']} The code interpreter runs in the user's browser; "
+                                'do not retry. Ask the user to reload the page and send the request again.'
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
                 else:
                     stdout = output.get('stdout', '')
                     stderr = output.get('stderr', '')
@@ -1047,21 +1085,12 @@ async def execute_code(
             'stderr': stderr,
             'result': result,
         }
-        if output_files or staged_warnings:
-            if output_files:
-                response['files'] = output_files
-            note = ''
-            if staged_files:
-                note = 'The staged files are attached to this chat and visible to the user. '
-            if output_files:
-                note += (
-                    'Each path in files[] is the file on the server; pass it to a file-upload '
-                    'tool — do not re-encode or re-send the bytes.'
-                )
-            if staged_warnings:
-                note = (note + ' ' + ' '.join(staged_warnings)).strip()
-            if note:
-                response['files_note'] = note
+        if output_files:
+            response['files'] = output_files
+        if staged_warnings:
+            # Model-facing warnings only. The file-passing contract belongs in the tool
+            # description, not in a sentence the UI then has to hide.
+            response['files_warning'] = ' '.join(staged_warnings)
 
         return JSONCodec.dumps(response, ensure_ascii=False)
     except Exception as e:

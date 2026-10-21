@@ -29,7 +29,7 @@
 		arguments?: string;
 		result?: string;
 		files?: string;
-		filesNote?: string;
+		filesWarning?: string;
 		embeds?: string;
 		done?: string;
 		status?: string;
@@ -79,6 +79,15 @@
 		} catch (e) {
 			return str;
 		}
+	}
+
+	function hideModelOnlyResultFields(value: unknown): unknown {
+		if (!value || typeof value !== 'object' || Array.isArray(value)) {
+			return value;
+		}
+		const record = { ...(value as Record<string, unknown>) };
+		delete record.files_note;
+		return record;
 	}
 
 	function parseArguments(str: string): Record<string, unknown> | null {
@@ -148,7 +157,7 @@
 
 	$: result = resultContent || decode(attributes?.result ?? '');
 	$: files = parseJSONString(decode(attributes?.files ?? ''));
-	$: filesNote = decode(attributes?.filesNote ?? '');
+	$: filesWarning = decode(attributes?.filesWarning ?? '');
 	$: stagedFiles = Array.isArray(files) ? files.filter(isStagedFile).slice(0, 20) : [];
 	$: embeds = parseJSONString(decode(attributes?.embeds ?? ''));
 	$: isAskUser = attributes?.name === 'ask_user';
@@ -169,7 +178,7 @@
 	$: isError = attributes?.status === 'failed' || (isDone && isToolResultError(result));
 
 	$: parsedArgs = parseArguments(args);
-	$: parsedResult = parseJSONString(result);
+	$: parsedResult = hideModelOnlyResultFields(parseJSONString(result));
 
 	const toggleOpen = () => {
 		open = !open;
@@ -440,8 +449,8 @@
 					})}
 				</div>
 			{/if}
-			{#if filesNote}
-				<div class="text-[0.6875rem] text-gray-500 dark:text-gray-400">{filesNote}</div>
+			{#if filesWarning}
+				<div class="text-[0.6875rem] text-gray-500 dark:text-gray-400">{filesWarning}</div>
 			{/if}
 		</div>
 	{/if}
