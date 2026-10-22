@@ -147,6 +147,7 @@ from open_webui.utils.task import (
     tools_function_calling_generation_template,
 )
 from open_webui.utils.tool_approval import complete_tool_call, pending_tool_calls
+from open_webui.utils.tool_filter import apply_tool_filter
 from open_webui.utils.tool_search import apply_tool_search
 from open_webui.utils.tools import (
     connect_mcp_server,
@@ -3409,6 +3410,15 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 tools_dict.pop(name)
 
         if tools_dict:
+            # Model-scoped allowlist (meta.toolFilter): a model may keep only the
+            # tool-server tools it needs, without a second MCP connection and
+            # without touching other models. Builtins are never filtered.
+            model_tool_filter = ((model.get('info') or {}).get('meta') or {}).get('toolFilter') or []
+            if model_tool_filter:
+                before_filter = len(tools_dict)
+                tools_dict = apply_tool_filter(tools_dict, model_tool_filter)
+                log.info('toolFilter kept %d of %d tools', len(tools_dict), before_filter)
+
             # Always store resolved tools in metadata so downstream consumers
             # (e.g. pipe functions) can access all tools including MCP and builtins.
             metadata['tools'] = tools_dict
