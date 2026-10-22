@@ -13,7 +13,7 @@ unaffected.
 from __future__ import annotations
 
 import fnmatch
-from typing import Iterable, Mapping
+from collections.abc import Iterable, Mapping
 
 # Tool dictionaries built for MCP connections and workspace/external tool servers.
 FILTERED_TOOL_TYPES = frozenset({'mcp', 'external'})
@@ -28,11 +28,7 @@ def tool_matches_filter(
     candidates = [resolved_name]
     if spec_name and spec_name != resolved_name:
         candidates.append(spec_name)
-    return any(
-        fnmatch.fnmatchcase(candidate, pattern)
-        for pattern in patterns
-        for candidate in candidates
-    )
+    return any(fnmatch.fnmatchcase(candidate, pattern) for pattern in patterns for candidate in candidates)
 
 
 def apply_tool_filter(

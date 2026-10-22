@@ -3417,9 +3417,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             if model_tool_filter:
                 before_filter = len(tools_dict)
                 tools_dict = apply_tool_filter(tools_dict, model_tool_filter)
-                log.info(
-                    'toolFilter kept %d of %d tools', len(tools_dict), before_filter
-                )
+                log.info('toolFilter kept %d of %d tools', len(tools_dict), before_filter)
 
             # Always store resolved tools in metadata so downstream consumers
             # (e.g. pipe functions) can access all tools including MCP and builtins.
