@@ -11,7 +11,8 @@
 #      model as image inputs (an SVG tool result used to reach DeepSeek as
 #      `data:image/svg+xml` and fail with HTTP 400);
 #   D. the tool-call UI surfaces staged files and their server paths;
-#   E. execute_code accepts files_to_save and stages interpreter files.
+#   E. execute_code accepts files_to_save and stages interpreter files;
+#   F. a model may scope its tool-server tools with meta.toolFilter.
 #
 # D and E live in the Svelte frontend, so the image builds the frontend from
 # this source tree as well as overlaying the patched backend modules.
@@ -42,6 +43,7 @@ COPY backend/open_webui/utils/files.py /app/backend/open_webui/utils/files.py
 COPY backend/open_webui/utils/code_interpreter.py /app/backend/open_webui/utils/code_interpreter.py
 COPY backend/open_webui/utils/kernel_pool.py /app/backend/open_webui/utils/kernel_pool.py
 COPY backend/open_webui/utils/interpreter_attachments.py /app/backend/open_webui/utils/interpreter_attachments.py
+COPY backend/open_webui/utils/tool_filter.py /app/backend/open_webui/utils/tool_filter.py
 COPY backend/open_webui/utils/middleware.py /app/backend/open_webui/utils/middleware.py
 COPY backend/open_webui/utils/misc.py /app/backend/open_webui/utils/misc.py
 COPY backend/open_webui/tools/builtin.py /app/backend/open_webui/tools/builtin.py
