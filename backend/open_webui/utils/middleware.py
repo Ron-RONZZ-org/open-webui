@@ -3596,7 +3596,17 @@ async def execute_tool_call(form_data, metadata, event_caller, tool_call):
 
     tool = metadata.get('tools', {}).get(name)
     if not tool:
-        return params, f'Error: Tool "{name}" not found.', None, None, False
+        # A builtin tool such as execute_code is offered per request from the
+        # client's feature flags, so it can be absent while an earlier turn in
+        # the same conversation used it. Name the likely cause and stop the
+        # retry loop instead of returning an opaque not-found.
+        return (
+            params,
+            f'Error: Tool "{name}" not found. If it is a built-in feature, it is disabled for this chat; do not retry. Ask the user to enable it and resend.',
+            None,
+            None,
+            False,
+        )
     tool_type = tool.get('type', '')
     direct_tool = tool.get('direct', False)
     allowed_params = tool.get('spec', {}).get('parameters', {}).get('properties', {}).keys()

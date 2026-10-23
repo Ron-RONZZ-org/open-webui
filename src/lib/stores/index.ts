@@ -120,9 +120,21 @@ export const visiblePinnedModels = derived([pinnedModels, models], ([$pinnedMode
 );
 
 export const audioQueue = writable<AudioQueue | null>(null);
-export const chatRequestQueues: Writable<
-	Record<string, { id: string; prompt: string; files: any[] }[]>
-> = writable({});
+
+export type ChatRequestQueueItem = {
+	id: string;
+	prompt: string;
+	files: any[];
+	/**
+	 * Feature flags as they were when the message was queued. "Send now" and
+	 * the automatic drain use this snapshot, so a toggle reset by a chat reload
+	 * between queueing and sending cannot silently disable the code interpreter
+	 * for the queued message.
+	 */
+	features?: Record<string, boolean | undefined>;
+};
+
+export const chatRequestQueues: Writable<Record<string, ChatRequestQueueItem[]>> = writable({});
 
 export type ChannelQueuedMessage = {
 	id: string;

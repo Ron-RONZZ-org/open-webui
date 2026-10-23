@@ -71,6 +71,7 @@
 	import { AudioQueue } from '$lib/utils/audio';
 	import { RealtimeCall, getBridgeTurnState, type BridgeSubmission } from '$lib/utils/realtime';
 	import { createTemporaryChatId, isTemporaryChatId } from '$lib/utils/chatId';
+	import { mergeFeatureFlags } from '$lib/utils/chat-features';
 	import {
 		applyResponseStreamEvent,
 		getOutputText,
@@ -815,12 +816,12 @@
 			prompt = input.prompt ?? '';
 			messageInput?.setText(prompt);
 			files = input.files ?? [];
-			selectedToolIds = input.selectedToolIds ?? [];
+			if (input.selectedToolIds?.length) selectedToolIds = input.selectedToolIds;
 			selectedSkillIds = input.selectedSkillIds ?? [];
 			selectedFilterIds = input.selectedFilterIds ?? [];
-			webSearchEnabled = input.webSearchEnabled ?? false;
-			imageGenerationEnabled = input.imageGenerationEnabled ?? false;
-			codeInterpreterEnabled = input.codeInterpreterEnabled ?? false;
+			// Feature toggles are not part of the draft. They are applied from the
+			// model's defaultFeatureIds on every load, so a draft cannot restore a
+			// stale `false` and hide the code interpreter.
 			// Ignore approval modes in older drafts. Restoring input must not overwrite chat
 			// parameters or invoke the change handler, which can save settings and approve tools.
 			return true;
@@ -915,9 +916,12 @@
 				await processNextInQueue(chatIdProp);
 			}
 
-			if (!(await restoreChatInput(storageChatInput))) {
-				await setDefaults();
-			}
+			// Defaults first, draft second: a draft carries the user's typed text
+			// and tool selection, not the feature toggles. Applying defaults only
+			// when no draft exists let a draft saved during a navigation reset
+			// keep the code interpreter off.
+			await setDefaults();
+			await restoreChatInput(storageChatInput);
 
 			messageInput?.focus({ preventScroll: true });
 		} else if (!embedded) {
@@ -1897,9 +1901,8 @@
 				selectedToolIds = [];
 				selectedSkillIds = [];
 				selectedFilterIds = [];
-				webSearchEnabled = false;
-				imageGenerationEnabled = false;
-				codeInterpreterEnabled = false;
+				// The feature toggles are not in the draft; leave them to the
+				// model defaults already applied for this chat.
 
 				await restoreChatInput(storageChatInput);
 			}
@@ -2967,13 +2970,16 @@
 		try {
 			const combinedPrompt = queuedMessages.map((m) => m.prompt).join('\n\n');
 			const combinedFiles = queuedMessages.flatMap((m) => m.files);
+			// The first item's snapshot is the feature state the batch was queued
+			// under; later items share the same chat and toggle.
+			const queuedFeatures = queuedMessages[0]?.features;
 
 			chatRequestQueues.update((q) => ({
 				...q,
 				[targetChatId]: (q[targetChatId] ?? []).filter((m) => !queuedMessageIds.has(m.id))
 			}));
 
-			await submitPrompt(combinedPrompt, combinedFiles);
+			await submitPrompt(combinedPrompt, combinedFiles, null, queuedFeatures);
 		} catch (error) {
 			console.error(error);
 			chatRequestQueues.update((q) => ({
@@ -3003,7 +3009,7 @@
 			}));
 			await stopResponse(false);
 			await tick();
-			await submitPrompt(item.prompt, item.files);
+			await submitPrompt(item.prompt, item.files, null, item.features);
 		} finally {
 			processingQueueChats.delete(targetChatId);
 			// Completion can arrive before submitPrompt returns, while the queue is locked.
@@ -3397,7 +3403,8 @@
 	const submitPrompt = async (
 		inputContent: string,
 		inputFiles: any[],
-		bridgeRequest: { userMessageId: string; modelId: string } | null = null
+		bridgeRequest: { userMessageId: string; modelId: string } | null = null,
+		featureOverride: Record<string, boolean | undefined> | undefined = undefined
 	) => {
 		const _files = structuredClone(inputFiles);
 
@@ -3447,7 +3454,10 @@
 
 		saveSessionSelectedModels();
 
-		return await sendMessage(history, userMessageId, { modelId: bridgeRequest?.modelId ?? null });
+		return await sendMessage(history, userMessageId, {
+			modelId: bridgeRequest?.modelId ?? null,
+			featureOverride
+		});
 	};
 
 	const handleManualCompact = async () => {
@@ -3686,7 +3696,10 @@
 			if (bridgeRequest) return { status: 'deferred' };
 			chatRequestQueues.update((q) => ({
 				...q,
-				[$chatId]: [...(q[$chatId] ?? []), { id: uuidv4(), prompt: userPrompt, files }]
+				[$chatId]: [
+					...(q[$chatId] ?? []),
+					{ id: uuidv4(), prompt: userPrompt, files, features: getFeatures() }
+				]
 			}));
 			messageInput?.setText('');
 			prompt = '';
@@ -3710,7 +3723,10 @@
 				const _files = structuredClone(files);
 				chatRequestQueues.update((q) => ({
 					...q,
-					[$chatId]: [...(q[$chatId] ?? []), { id: uuidv4(), prompt: userPrompt, files: _files }]
+					[$chatId]: [
+						...(q[$chatId] ?? []),
+						{ id: uuidv4(), prompt: userPrompt, files: _files, features: getFeatures() }
+					]
 				}));
 				// Clear input
 				messageInput?.setText('');
@@ -3741,12 +3757,14 @@
 			messages = null,
 			modelId = null,
 			modelIdx = null,
-			regenerationPrompt = null
+			regenerationPrompt = null,
+			featureOverride = undefined
 		}: {
 			messages?: any[] | null;
 			modelId?: string | null;
 			modelIdx?: number | null;
 			regenerationPrompt?: string | null;
+			featureOverride?: Record<string, boolean | undefined>;
 		} = {}
 	) => {
 		if (autoScroll) {
@@ -3894,7 +3912,8 @@
 						// regenerations in a duplicate-model chat, which would otherwise lose their
 						// column identity and collapse on reload.
 						messageIdsList: messageIdsList.length > 0 ? messageIdsList : undefined,
-						regenerationPrompt
+						regenerationPrompt,
+						featureOverride
 					}
 				);
 				submittedTaskIds =
@@ -3958,11 +3977,13 @@
 		{
 			messageIdsList,
 			regenerationPrompt,
-			continueResponse = false
+			continueResponse = false,
+			featureOverride = undefined
 		}: {
 			messageIdsList?: Array<{ model_id: string; message_id: string }>;
 			regenerationPrompt?: string | null;
 			continueResponse?: boolean;
+			featureOverride?: Record<string, boolean | undefined>;
 		} = {}
 	) => {
 		const responseMessage = _history.messages[responseMessageId];
@@ -4143,7 +4164,7 @@
 								: [])
 						]
 					: [],
-				features: getFeatures(),
+				features: mergeFeatureFlags(getFeatures(), featureOverride),
 				variables: {
 					...getPromptVariables(
 						$user?.name,
@@ -4562,10 +4583,7 @@
 			})),
 		selectedToolIds,
 		selectedSkillIds,
-		selectedFilterIds,
-		imageGenerationEnabled,
-		webSearchEnabled,
-		codeInterpreterEnabled
+		selectedFilterIds
 	});
 
 	const saveDraft = async (draft: any, chatId: string | null = null, debounce = true) => {

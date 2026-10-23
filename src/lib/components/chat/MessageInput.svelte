@@ -265,10 +265,12 @@
 			}),
 		selectedToolIds,
 		selectedSkillIds,
-		selectedFilterIds,
-		imageGenerationEnabled,
-		webSearchEnabled,
-		codeInterpreterEnabled
+		selectedFilterIds
+		// Feature toggles deliberately stay out of the draft: they are derived
+		// from the model's defaultFeatureIds on every chat load. A draft saved
+		// while a navigation reset the toggle to false would otherwise restore
+		// that reset and skip the model defaults, which is how the code
+		// interpreter disappeared from a chat on 2026-10-22.
 	};
 
 	$: onChange(chatInputDraft);
