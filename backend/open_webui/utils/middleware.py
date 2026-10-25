@@ -2528,6 +2528,14 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     if not isinstance(metadata.get('chat_id'), str):
         metadata['chat_id'] = ''
 
+    # The interpreter must see the whole conversation's files, not just the
+    # current message's: a follow-up turn carries none, and a model switched
+    # mid-chat has to continue from what an earlier model produced. Capture the
+    # request's own messages before the provider rewrite drops their files.
+    from open_webui.utils.interpreter_attachments import collect_conversation_files
+
+    metadata['conversation_files'] = collect_conversation_files(form_data.get('messages') or [])
+
     # Pipeline Inlet -> Filter Inlet -> Chat Memory -> Chat Web Search -> Chat Image Generation
     # -> Chat Code Interpreter (Form Data Update) -> (Default) Chat Tools Function Calling
     # -> Chat Files
@@ -3132,11 +3140,6 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         # Remove duplicate files based on their content
         files = list({json.dumps(f, sort_keys=True): f for f in files}.values())
 
-    # The interpreter must see the whole conversation's files, not just the
-    # current message's: a follow-up turn carries none, and a model switched
-    # mid-chat has to continue from what an earlier model produced.
-    from open_webui.utils.interpreter_attachments import collect_conversation_files
-
     metadata.update(
         {
             'model_id': form_data.get('model'),
@@ -3144,7 +3147,6 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             'skill_ids': skill_ids,
             'terminal_id': terminal_id,
             'files': files,
-            'conversation_files': collect_conversation_files(form_data.get('messages') or []),
             'features': features,
         }
     )
