@@ -11,7 +11,8 @@
 #      model as image inputs (an SVG tool result used to reach DeepSeek as
 #      `data:image/svg+xml` and fail with HTTP 400);
 #   D. the tool-call UI surfaces staged files and their server paths;
-#   E. execute_code accepts files_to_save and stages interpreter files;
+#   E. execute_code accepts files_to_save, stages interpreter files, and stages
+#      the current message's attachments (resolved from their file records);
 #   F. a model may scope its tool-server tools with meta.toolFilter.
 #
 # D and E live in the Svelte frontend, so the image builds the frontend from

@@ -974,18 +974,30 @@ async def execute_code(
                 result = str(output) if output else ''
 
         elif engine == 'jupyter':
+            from open_webui.models.files import Files
             from open_webui.utils.code_interpreter import execute_code_jupyter
-            from open_webui.utils.interpreter_attachments import stage_attachments
+            from open_webui.utils.interpreter_attachments import (
+                resolve_attachment_paths,
+                stage_attachments,
+            )
 
             jupyter_auth = await Config.get('code_interpreter.jupyter.auth')
+
+            # A chat message's file entry carries the upload id, not the server
+            # path: resolve the path from the file record before staging.
+            async def _lookup_file(file_id: str):
+                return await Files.get_file_by_id_and_user_id(file_id, (__user__ or {}).get('id'))
 
             # The sandbox is a separate container and cannot read the upload store.
             # Copy this conversation's attachments into its inbox and pass a
             # manifest, so generated code sees this chat's files and nothing else.
+            attachment_items = _collect_interpreter_files(__metadata__ or {})
+            if (__user__ or {}).get('id'):
+                attachment_items = await resolve_attachment_paths(attachment_items, _lookup_file)
             attachments, attachment_warnings = await asyncio.to_thread(
                 stage_attachments,
                 __chat_id__,
-                _collect_interpreter_files(__metadata__ or {}),
+                attachment_items,
             )
             staged_warnings.extend(attachment_warnings)
 
