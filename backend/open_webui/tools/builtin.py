@@ -67,6 +67,7 @@ from open_webui.socket.main import sio
 from open_webui.tasks import stop_item_tasks
 from open_webui.tools.knowledge_fs import kb_exec  # noqa: F401 — re-exported
 from open_webui.utils.chat_id import is_saved_chat_id
+from open_webui.utils.interpreter_attachments import unique_files
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.notifications import notify_target
 from open_webui.utils.sanitize import sanitize_code
@@ -826,27 +827,18 @@ def _collect_interpreter_files(metadata: dict) -> list[dict]:
 
     ``metadata['files']`` is the retrieval list and deliberately excludes raster
     images (they are sent to the model as image inputs). The interpreter needs the
-    bytes of every attachment, including images, so merge in the files on the
-    current user message and deduplicate by file id/url/name.
+    bytes of every attachment, including images and the artifacts an earlier turn
+    produced, so merge in the current user message's files and the conversation's
+    files, deduplicating by file id/url/name.
     """
     user_message = metadata.get('user_message') or {}
-    merged: list[dict] = []
-    seen: set[str] = set()
-
-    for item in [*(metadata.get('files') or []), *(user_message.get('files') or [])]:
-        if not isinstance(item, dict):
-            continue
-        file_item = item.get('file') if isinstance(item.get('file'), dict) else {}
-        key = str(
-            item.get('id') or file_item.get('id') or item.get('url') or item.get('name') or item.get('filename') or ''
-        )
-        if key and key in seen:
-            continue
-        if key:
-            seen.add(key)
-        merged.append(item)
-
-    return merged
+    return unique_files(
+        [
+            metadata.get('files') or [],
+            user_message.get('files') or [],
+            metadata.get('conversation_files') or [],
+        ]
+    )
 
 
 async def execute_code(
