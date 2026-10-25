@@ -212,3 +212,37 @@ def test_an_inline_data_url_is_staged(sandbox):
     assert warnings == []
     assert manifest[0]['name'] == 'shot.png'
     assert Path(manifest[0]['path']).read_bytes() == b'png-bytes'
+
+
+def test_collect_conversation_files_keeps_every_message_newest_first():
+    messages = [
+        {'role': 'user', 'files': [chat_file_item('a', 'first.png')]},
+        {
+            'role': 'assistant',
+            'files': [{'type': 'image', 'id': 'b', 'url': '/api/v1/files/b/content', 'name': 'art.svg'}],
+        },
+        {'role': 'user', 'files': []},
+    ]
+
+    files = attachments.collect_conversation_files(messages)
+
+    assert [entry['name'] for entry in files] == ['art.svg', 'first.png']
+
+
+def test_collect_conversation_files_deduplicates_by_file_id():
+    item = chat_file_item('a', 'bildo.png')
+
+    files = attachments.collect_conversation_files(
+        [{'role': 'user', 'files': [item]}, {'role': 'assistant', 'files': [dict(item)]}]
+    )
+
+    assert [entry['id'] for entry in files] == ['a']
+
+
+def test_unique_files_keeps_the_first_appearance():
+    first = {'id': 'a', 'name': 'a.png'}
+    second = {'id': 'b', 'name': 'b.png'}
+
+    merged = attachments.unique_files([[first], [dict(first), second]])
+
+    assert merged == [first, second]

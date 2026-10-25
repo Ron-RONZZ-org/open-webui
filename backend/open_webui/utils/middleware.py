@@ -3132,6 +3132,11 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         # Remove duplicate files based on their content
         files = list({json.dumps(f, sort_keys=True): f for f in files}.values())
 
+    # The interpreter must see the whole conversation's files, not just the
+    # current message's: a follow-up turn carries none, and a model switched
+    # mid-chat has to continue from what an earlier model produced.
+    from open_webui.utils.interpreter_attachments import collect_conversation_files
+
     metadata.update(
         {
             'model_id': form_data.get('model'),
@@ -3139,6 +3144,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             'skill_ids': skill_ids,
             'terminal_id': terminal_id,
             'files': files,
+            'conversation_files': collect_conversation_files(form_data.get('messages') or []),
             'features': features,
         }
     )
@@ -3210,6 +3216,9 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                                     **tool_spec,
                                     'name': tool_name,
                                 },
+                                # The spec name is rewritten to the prefixed tool name,
+                                # so keep the server's own name for meta.toolFilter.
+                                'raw_name': tool_spec['name'],
                                 'callable': tool_function,
                                 'type': 'mcp',
                                 'client': client,

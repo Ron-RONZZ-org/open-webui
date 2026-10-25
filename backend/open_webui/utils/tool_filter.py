@@ -1,10 +1,13 @@
 """Model-scoped allowlist for tool-server tools.
 
-A model's ``meta.toolFilter`` keeps only the tool-server tools whose name (the
-resolved ``server_tool`` name) or raw tool name matches one of its ``fnmatch``
-patterns. Builtin tools (the code interpreter, knowledge, web search, …) are
-never filtered: they are capabilities rather than tool servers, and their names
-are not stable configuration surface.
+A model's ``meta.toolFilter`` keeps only the tool-server tools whose resolved
+name or raw tool name matches one of its ``fnmatch`` patterns. An MCP tool is
+stored under ``<server_id>_<tool>`` and its spec name is rewritten to that same
+prefixed name, so the raw name travels separately in ``raw_name``; without it a
+bare pattern such as ``upload-file`` cannot match anything and the whole
+connection is filtered out. Builtin tools (the code interpreter, knowledge, web
+search, …) are never filtered: they are capabilities rather than tool servers,
+and their names are not stable configuration surface.
 
 An empty or missing ``toolFilter`` keeps every tool, so existing models are
 unaffected.
@@ -23,11 +26,13 @@ def tool_matches_filter(
     patterns: Iterable[str],
     resolved_name: str,
     spec_name: str | None = None,
+    raw_name: str | None = None,
 ) -> bool:
-    """True when a pattern matches the resolved name or the raw tool name."""
+    """True when a pattern matches the resolved name, the raw tool name, or the spec name."""
     candidates = [resolved_name]
-    if spec_name and spec_name != resolved_name:
-        candidates.append(spec_name)
+    for candidate in (spec_name, raw_name):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
     return any(fnmatch.fnmatchcase(candidate, pattern) for pattern in patterns for candidate in candidates)
 
 
@@ -51,6 +56,6 @@ def apply_tool_filter(
             kept[name] = tool
             continue
         spec_name = (tool.get('spec') or {}).get('name')
-        if tool_matches_filter(active, name, spec_name):
+        if tool_matches_filter(active, name, spec_name, tool.get('raw_name')):
             kept[name] = tool
     return kept

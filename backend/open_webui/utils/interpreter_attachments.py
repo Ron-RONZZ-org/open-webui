@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import shutil
+from collections.abc import Iterable
 from pathlib import Path
 from urllib.parse import unquote_to_bytes
 
@@ -117,6 +118,47 @@ def _inline_bytes(item: dict) -> tuple[bytes, str] | None:
     if not Path(name).suffix:
         name = f'{name}{_EXTENSION_BY_MIME.get(match.group("mime").lower(), "")}'
     return data, name
+
+
+def _file_key(item: dict) -> str:
+    """A stable identity for a file entry, used to merge duplicates."""
+    file_item = _file_item(item)
+    return str(
+        item.get('id')
+        or file_item.get('id')
+        or item.get('url')
+        or file_item.get('url')
+        or item.get('name')
+        or file_item.get('filename')
+        or ''
+    )
+
+
+def unique_files(groups: Iterable[Iterable[dict]]) -> list[dict]:
+    """Merge attachment lists, keeping the first appearance of each file."""
+    merged: list[dict] = []
+    seen: set[str] = set()
+    for group in groups:
+        for item in group or []:
+            if not isinstance(item, dict):
+                continue
+            key = _file_key(item)
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            merged.append(item)
+    return merged
+
+
+def collect_conversation_files(messages: Iterable[dict]) -> list[dict]:
+    """Every file attached to any message in the conversation, newest message first.
+
+    A follow-up turn carries no files of its own, and a model switched mid-chat
+    must still see the attachment and the artifacts an earlier model produced.
+    """
+    ordered = [message for message in (messages or []) if isinstance(message, dict)]
+    return unique_files(message.get('files') or [] for message in reversed(ordered))
 
 
 async def resolve_attachment_paths(items: list[dict], lookup) -> list[dict]:
