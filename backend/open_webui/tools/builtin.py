@@ -2741,7 +2741,12 @@ async def list_chat_files(
     """
     List files attached to the current chat.
 
-    :return: JSON with attached chat files containing id, filename, content type, size, and updated time when available
+    Each entry carries the server-side path of the upload (``path``) when the
+    file record has one. The wiki-writer tool server mounts the OWUI upload
+    store read-only at the same path, so a model can pass that path to a
+    file-upload tool (e.g. to attach a user-supplied PDF to a wiki source).
+
+    :return: JSON with attached chat files containing id, filename, content type, size, updated time, and the server-side path when available
     """
     if __request__ is None:
         return JSONCodec.dumps({'error': 'Request context not available'})
@@ -2759,6 +2764,13 @@ async def list_chat_files(
                 'type': item.get('type', 'file'),
                 'updated_at': file.updated_at,
             }
+            # The server-side upload location (e.g. `/app/backend/data/uploads/
+            # <id>_<name>`). Only files this user can read are listed (the
+            # access check is in _get_accessible_chat_files), and the path is
+            # what the wiki-writer's upload tools resolve inside their own
+            # read-only mount of the same store.
+            if getattr(file, 'path', None):
+                file_info['path'] = file.path
             content_type = item.get('content_type') or (file.meta or {}).get('content_type')
             size = item.get('size') or (file.meta or {}).get('size')
             if content_type:
