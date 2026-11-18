@@ -674,17 +674,13 @@ async def get_builtin_tools(
     files_enabled = is_builtin_tool_enabled('files')
     file_upload = get_model_capability('file_upload')
     if files_enabled and file_upload and has_chat_files:
-        file_tools = file_tool_scope(
+        if file_tool_scope(
             files_enabled=files_enabled,
             file_upload=file_upload,
             chat_has_files=has_chat_files,
             user_can_upload=await has_user_chat_permission('file_upload'),
-            file_context=get_model_capability('file_context'),
-        )
-        if file_tools.list_chat_files:
-            builtin_functions.append(list_chat_files)
-        if file_tools.read_content:
-            builtin_functions.extend([query_chat_files, grep_chat_files, view_file])
+        ):
+            builtin_functions.extend([list_chat_files, query_chat_files, grep_chat_files, view_file])
 
     # Knowledge base tools - conditional injection based on model knowledge
     # If model has attached knowledge (any type), only provide query_knowledge_files

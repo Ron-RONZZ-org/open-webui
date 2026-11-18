@@ -1,22 +1,20 @@
-"""Which built-in chat-file tools a model is offered.
+"""Whether the built-in chat-file tools are offered for a request.
 
-``list_chat_files`` returns upload metadata — the file id, name and the
-server-side store path — not the file content. A model that already reads file
-content (``file_context``) still needs that path to hand an upload to an
-external tool server, so the metadata tool is exposed whenever the chat has
-files and the user may upload. The content-reading tools stay limited to models
-without file context, where they are the only way to read an upload.
+All four tools are exposed together once the request may carry chat files:
+
+* ``list_chat_files`` — upload metadata, including the server-side store path,
+  which a model hands to an external tool server (e.g. the wiki writer's
+  ``accessFile``), not file content.
+* ``query_chat_files`` / ``grep_chat_files`` / ``view_file`` — the file content,
+  through semantic search, exact text search and paginated reading.
+
+``file_context`` is not a reason to withhold the readers. It only controls the
+automatic context injection, and with ``rag.full_context`` off that injection is
+top-k retrieval — an excerpt, not the document. A model told "here is the file"
+would then have no way to read the rest of it, so the readers are offered
+whenever the request may have chat files. The ``<attached_files>`` block that
+``add_file_context`` adds carries each file's id, which is what the readers take.
 """
-
-from dataclasses import dataclass
-
-
-@dataclass(frozen=True)
-class FileToolScope:
-    """The chat-file tools to expose for one request."""
-
-    list_chat_files: bool
-    read_content: bool
 
 
 def file_tool_scope(
@@ -25,14 +23,11 @@ def file_tool_scope(
     file_upload: bool,
     chat_has_files: bool,
     user_can_upload: bool,
-    file_context: bool,
-) -> FileToolScope:
-    """Decide which built-in file tools the request gets.
+) -> bool:
+    """Return whether the request gets the built-in chat-file tools.
 
-    ``list_chat_files`` is metadata discovery and is always exposed once the
-    request may upload; ``query_chat_files``/``grep_chat_files``/``view_file``
-    read content and remain gated on the model not having file context.
+    The tools appear only when every gate holds: the ``files`` builtin category
+    is enabled for the model, the model declares ``file_upload``, the chat
+    actually carries an upload, and the user may upload files.
     """
-    if not (files_enabled and file_upload and chat_has_files and user_can_upload):
-        return FileToolScope(list_chat_files=False, read_content=False)
-    return FileToolScope(list_chat_files=True, read_content=not file_context)
+    return bool(files_enabled and file_upload and chat_has_files and user_can_upload)
