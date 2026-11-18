@@ -44,6 +44,11 @@ jobs:
         with:
           node-version: '22'
       - name: Install dependencies
+        # onnxruntime-node's postinstall downloads a CUDA build on linux/x64;
+        # microsoft/onnxruntime deleted the v1.21.0 asset (HTTP 404). Unit
+        # tests do not need the CUDA execution provider.
+        env:
+          ONNXRUNTIME_NODE_INSTALL_CUDA: skip
         run: npm ci --force
       - name: Vitest
         run: npm run test:frontend
