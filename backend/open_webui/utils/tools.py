@@ -41,6 +41,7 @@ from open_webui.env import (
     REDIS_KEY_PREFIX,
 )
 from open_webui.models.access_grants import AccessGrants
+from open_webui.models.chats import Chats
 from open_webui.models.config import Config
 from open_webui.models.groups import Groups
 from open_webui.models.tools import Tools
@@ -665,6 +666,13 @@ async def get_builtin_tools(
         builtin_functions.append(ask_user)
 
     metadata = extra_params.get('__metadata__') or {}
+    is_subagent_session = getattr(request.state, 'is_subagent', False) is True
+    if not is_subagent_session and metadata.get('chat_id'):
+        try:
+            chat = await Chats.get_chat_by_id(metadata['chat_id'])
+            is_subagent_session = bool(chat and (chat.meta or {}).get('delegation'))
+        except Exception:
+            is_subagent_session = False
     chat_files = metadata.get('files') or extra_params.get('__files__') or []
     has_chat_files = any(
         isinstance(item, dict)
@@ -734,15 +742,17 @@ async def get_builtin_tools(
         is_builtin_tool_enabled('subagents')
         and config.get('subagents.enable')
         and getattr(request.state, 'internal', False) is not True
-        and getattr(request.state, 'is_subagent', False) is not True
+        and not is_subagent_session
         and getattr(request.state, 'direct', False) is not True
         and not is_temporary_chat_id(metadata.get('chat_id'))
     ):
         builtin_functions.extend([delegate_task, timer, message_subagent])
 
     # A visible subagent owns its own session: it can report to the parent and
-    # signal completion, but it cannot delegate again.
-    if config.get('subagents.enable') and getattr(request.state, 'is_subagent', False) is True:
+    # signal completion, but it cannot delegate again. The initial delegated run
+    # carries `is_subagent`; later user turns are detected from the chat's
+    # `meta.delegation`, so the child keeps the tools for the whole session.
+    if config.get('subagents.enable') and is_subagent_session:
         builtin_functions.extend([contact_parent, signal_completion_to_parent])
 
     # Add memory tools when memory is enabled and the model allows this builtin category.
