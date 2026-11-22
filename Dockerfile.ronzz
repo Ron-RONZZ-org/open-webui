@@ -16,7 +16,10 @@
 #   F. a model may scope its tool-server tools with meta.toolFilter; patterns
 #      match the resolved name, the spec name, or the server's raw tool name;
 #   G. the chat-file metadata tool (list_chat_files, which returns the upload's
-#      server-side path) is exposed even to models with file_context.
+#      server-side path) is exposed even to models with file_context;
+#   H. visible role subagents: delegate_task(agent, mode), contact_parent,
+#      signal_completion_to_parent, the quota approval, and the ask_user
+#      conditional free-text extension.
 #
 # D and E live in the Svelte frontend, so the image builds the frontend from
 # this source tree as well as overlaying the patched backend modules.
@@ -52,6 +55,10 @@ COPY backend/open_webui/utils/file_tools.py /app/backend/open_webui/utils/file_t
 COPY backend/open_webui/utils/tools.py /app/backend/open_webui/utils/tools.py
 COPY backend/open_webui/utils/middleware.py /app/backend/open_webui/utils/middleware.py
 COPY backend/open_webui/utils/misc.py /app/backend/open_webui/utils/misc.py
+COPY backend/open_webui/utils/subagents.py /app/backend/open_webui/utils/subagents.py
+COPY backend/open_webui/utils/ask_user.py /app/backend/open_webui/utils/ask_user.py
+COPY backend/open_webui/utils/delegations.py /app/backend/open_webui/utils/delegations.py
+COPY backend/open_webui/utils/subagent_roles.py /app/backend/open_webui/utils/subagent_roles.py
 COPY backend/open_webui/tools/builtin.py /app/backend/open_webui/tools/builtin.py
 
 # Drop bytecode cached in the base image for the replaced modules, so Python
@@ -65,4 +72,8 @@ RUN rm -f \
       /app/backend/open_webui/utils/__pycache__/tools.*.pyc \
       /app/backend/open_webui/utils/__pycache__/middleware.*.pyc \
       /app/backend/open_webui/utils/__pycache__/misc.*.pyc \
+      /app/backend/open_webui/utils/__pycache__/subagents.*.pyc \
+      /app/backend/open_webui/utils/__pycache__/ask_user.*.pyc \
+      /app/backend/open_webui/utils/__pycache__/delegations.*.pyc \
+      /app/backend/open_webui/utils/__pycache__/subagent_roles.*.pyc \
       /app/backend/open_webui/tools/__pycache__/builtin.*.pyc
