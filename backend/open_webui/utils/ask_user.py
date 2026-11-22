@@ -1,7 +1,5 @@
 from collections.abc import Callable
 
-from open_webui.utils.json_codec import JSONCodec
-
 
 ASK_USER_NAME = 'ask_user'
 
@@ -20,6 +18,41 @@ def get_ask_user_tool_calls(tool_calls: list[dict]) -> tuple[list[dict], str | N
     if len(ask_user_calls) != 1:
         return ask_user_calls, 'Error: only one ask_user call is allowed per turn.'
     return ask_user_calls, None
+
+
+def _normalize_free_text(blocks: list, option_values: set[str]) -> list[dict]:
+    normalized = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            raise ValueError('Each free_text block must be an object.')
+        when = block.get('when')
+        if not isinstance(when, list) or not 1 <= len(when) <= 3:
+            raise ValueError('free_text.when requires 1-3 option values.')
+        when = [str(value).strip() for value in when]
+        if any(value not in option_values for value in when):
+            raise ValueError('free_text.when must reference an option value.')
+
+        input_type = str(block.get('input_type') or 'text').strip().lower()
+        if input_type not in {'text', 'number'}:
+            raise ValueError('free_text.input_type must be text or number.')
+
+        item = {
+            'when': when,
+            'input_type': input_type,
+            'placeholder': str(block.get('placeholder') or '').strip()[:240],
+            'multiline': bool(block.get('multiline', False)) and input_type == 'text',
+            'required': bool(block.get('required', True)),
+        }
+        if input_type == 'number':
+            for key in ('min', 'max'):
+                value = block.get(key)
+                if value is None:
+                    continue
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise ValueError(f'free_text.{key} must be a number.')
+                item[key] = int(value)
+        normalized.append(item)
+    return normalized
 
 
 def normalize_ask_user_request(arguments: dict) -> dict:
@@ -46,6 +79,7 @@ def normalize_ask_user_request(arguments: dict) -> dict:
             raise ValueError('Each question requires 2-3 options.')
 
         normalized_options = []
+        option_values = set()
         for option in options:
             if not isinstance(option, dict):
                 raise ValueError('Each option must be an object.')
@@ -53,11 +87,29 @@ def normalize_ask_user_request(arguments: dict) -> dict:
             description = str(option.get('description') or '').strip()[:240]
             if not label or not description:
                 raise ValueError('Each option requires a label and description.')
-            normalized_options.append({'label': label, 'description': description})
+            value = str(option.get('value') or label).strip()[:80]
+            if value in option_values:
+                raise ValueError(f'Duplicate option value: {value}')
+            option_values.add(value)
+            normalized_options.append({'label': label, 'description': description, 'value': value})
 
         question_text = str(question.get('question') or '').strip()[:500]
         if not question_text:
             raise ValueError('Each question requires question text.')
+
+        free_text = question.get('free_text') or []
+        if not isinstance(free_text, list):
+            raise ValueError('free_text must be a list.')
+        reject_text = question.get('reject_text')
+        if reject_text is not None:
+            if not isinstance(reject_text, dict):
+                raise ValueError('reject_text must be an object.')
+            free_text = [
+                *free_text,
+                {**reject_text, 'when': ['reject']},
+            ]
+        if len(free_text) > 3:
+            raise ValueError('A question accepts at most 3 free_text blocks.')
 
         normalized_questions.append(
             {
@@ -65,6 +117,7 @@ def normalize_ask_user_request(arguments: dict) -> dict:
                 'header': str(question.get('header') or '').strip()[:48] or f'Question {index + 1}',
                 'question': question_text,
                 'options': normalized_options,
+                'free_text': _normalize_free_text(free_text, option_values),
                 'allow_other': bool(question.get('allow_other', allow_other)),
             }
         )
@@ -80,11 +133,46 @@ def normalize_ask_user_request(arguments: dict) -> dict:
     }
 
 
+async def request_user_input(
+    event_call,
+    questions: list[dict],
+    *,
+    allow_other: bool = True,
+    timeout_ms: int = 120_000,
+) -> dict:
+    """Ask the user through the browser and return a normalised result.
+
+    Shared by ``ask_user`` and the sub-agent approval gates. The caller supplies
+    the ``__event_call__`` of the active request; it is ``None`` for headless
+    runs, where the gate cannot be resolved.
+    """
+    try:
+        payload = normalize_ask_user_request(
+            {'questions': questions, 'allow_other': allow_other, 'timeout_ms': timeout_ms}
+        )
+    except (TypeError, ValueError) as exc:
+        return {'status': 'error', 'error': str(exc)}
+
+    if event_call is None:
+        return {'status': 'error', 'error': 'User input requires an active browser session.'}
+
+    output = await event_call({'type': 'request:user_input', 'data': payload})
+    if not isinstance(output, dict):
+        return {'status': 'error', 'error': 'Invalid user input response.'}
+    if output.get('error'):
+        return {'status': 'error', 'error': output.get('error')}
+    if output.get('status') == 'cancelled':
+        return {'status': 'cancelled', 'answers': {}}
+    return {'status': 'answered', 'answers': output.get('answers', {})}
+
+
 def stage_ask_user_tool_calls(
     tool_calls: list[dict],
     output: list[dict],
     make_output_id: Callable[[str], str],
 ) -> tuple[bool, str | None]:
+    from open_webui.utils.json_codec import JSONCodec
+
     ask_user_calls, error = get_ask_user_tool_calls(tool_calls)
     if not ask_user_calls:
         return False, None

@@ -52,7 +52,10 @@ from open_webui.tools.builtin import (
     create_automation,
     create_calendar_event,
     create_tasks,
+    contact_parent,
     delegate_task,
+    message_subagent,
+    signal_completion_to_parent,
     delete_automation,
     delete_calendar_event,
     delete_memory,
@@ -731,10 +734,16 @@ async def get_builtin_tools(
         is_builtin_tool_enabled('subagents')
         and config.get('subagents.enable')
         and getattr(request.state, 'internal', False) is not True
+        and getattr(request.state, 'is_subagent', False) is not True
         and getattr(request.state, 'direct', False) is not True
         and not is_temporary_chat_id(metadata.get('chat_id'))
     ):
-        builtin_functions.extend([delegate_task, timer])
+        builtin_functions.extend([delegate_task, timer, message_subagent])
+
+    # A visible subagent owns its own session: it can report to the parent and
+    # signal completion, but it cannot delegate again.
+    if config.get('subagents.enable') and getattr(request.state, 'is_subagent', False) is True:
+        builtin_functions.extend([contact_parent, signal_completion_to_parent])
 
     # Add memory tools when memory is enabled and the model allows this builtin category.
     if (
