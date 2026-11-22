@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 import time
 import weakref
 from datetime import timedelta
@@ -13,13 +14,34 @@ from open_webui.models.chat_messages import ChatMessages
 from open_webui.models.chats import ChatForm, Chats
 from open_webui.models.config import Config
 from open_webui.models.auths import Auths
+from open_webui.models.models import Models
 from open_webui.models.users import UserModel, Users
 from open_webui.tasks import create_task, has_active_tasks
+from open_webui.utils.ask_user import request_user_input
 from open_webui.utils.auth import VERIFIED_USER_ROLES, create_token
+from open_webui.utils.delegations import (
+    get_delegation,
+    mark_orphaned,
+    register_delegation,
+    resolve_child_chat_id,
+    update_delegation,
+)
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.misc import add_or_update_system_message, get_message_list
+from open_webui.utils.subagent_roles import (
+    AGENT_TAG,
+    DEFAULT_CONTACT_ALLOWANCE,
+    agent_tool_ids,
+    is_agent_model,
+    needs_quota_approval,
+    parse_decision,
+    quota_question,
+    summon_question,
+)
 from open_webui.utils.tool_search import strip_deferred_tools_manifest
 from starlette.datastructures import Headers
+
+log = logging.getLogger(__name__)
 
 DEFAULT_SUBAGENT_SYSTEM_PROMPT = """You are a sub-agent working on a specific task assigned by the lead agent.
 
@@ -45,7 +67,7 @@ _foreground_semaphore: asyncio.Semaphore | None = None
 _parent_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 
 
-async def _build_request(source: Request, user_id: str, *, internal: bool) -> Request:
+async def _build_request(source: Request, user_id: str, *, internal: bool, is_subagent: bool = False) -> Request:
     scope = {
         'type': 'http',
         'asgi': {'version': '3.0', 'spec_version': '2.0'},
@@ -70,6 +92,8 @@ async def _build_request(source: Request, user_id: str, *, internal: bool) -> Re
     request.state.enable_api_keys = False
     if internal:
         request.state.internal = True
+    if is_subagent:
+        request.state.is_subagent = True
     return request
 
 
@@ -709,3 +733,487 @@ async def delegate(
     if result.get('status') != 'completed':
         return f'Error: {result.get("error") or "sub-agent failed."}'
     return result.get('summary') or 'Sub-agent produced no output.'
+
+
+# =============================================================================
+# Visible role sessions
+# =============================================================================
+
+
+def _select_files(metadata: dict, file_ids: list[str] | None) -> list[dict]:
+    files = copy.deepcopy(metadata.get('files') or [])
+    if not file_ids:
+        return []
+    wanted = {str(file_id) for file_id in file_ids if file_id}
+    selected = []
+    for entry in files:
+        values = {str(entry.get('id') or ''), str(entry.get('url') or '')}
+        if isinstance(entry.get('file'), dict):
+            values.add(str(entry['file'].get('id') or ''))
+        if values & wanted:
+            selected.append(entry)
+    return selected
+
+
+def _parent_run(metadata: dict) -> dict:
+    return {
+        'model_id': metadata.get('model_id') or (metadata.get('model') or {}).get('id'),
+        'session_id': metadata.get('session_id'),
+        'tool_ids': copy.deepcopy(metadata.get('tool_ids') or []),
+        'skill_ids': copy.deepcopy(metadata.get('skill_ids') or []),
+        'chat_context': copy.deepcopy(metadata.get('chat_context') or {}),
+        'filter_ids': copy.deepcopy(metadata.get('filter_ids') or []),
+        'terminal_id': metadata.get('terminal_id'),
+        'features': copy.deepcopy(metadata.get('features') or {}),
+        'variables': copy.deepcopy(metadata.get('variables') or {}),
+        'chat_variables': copy.deepcopy(metadata.get('chat_variables')),
+        'files': copy.deepcopy(metadata.get('files') or []),
+    }
+
+
+async def delegate_session(
+    task: str,
+    context: str,
+    *,
+    agent: str,
+    file_ids: list[str] | None,
+    request: Request,
+    user_data: dict,
+    metadata: dict,
+    parent_chat_id: str,
+    parent_message_id: str | None,
+    event_call,
+) -> str:
+    """Summon a role model in a visible, user-owned chat.
+
+    Approval happens before the chat exists. The child runs with isolated context
+    (task + explicit context + files) and the parent is not blocked.
+    """
+    task = (task or '').strip()
+    if not task:
+        return 'Error: task must not be empty.'
+    if not agent:
+        return 'Error: agent is required for a visible session.'
+    if not parent_chat_id or not user_data.get('id'):
+        return 'Error: chat and user context are required.'
+
+    role_model = await Models.get_model_by_id(agent)
+    if not role_model:
+        return f'Error: agent model {agent!r} not found.'
+    role_meta = role_model.meta.model_dump() if role_model.meta else {}
+    if not is_agent_model(role_meta, role_model.base_model_id):
+        return f'Error: {agent!r} is not a delegatable agent (missing tag {AGENT_TAG}).'
+    role_name = role_model.name or agent
+    role_tool_ids = agent_tool_ids(role_meta)
+
+    approval = await request_user_input(event_call, [summon_question(role_name, task)])
+    if approval.get('status') != 'answered':
+        return JSONCodec.dumps(
+            {
+                'status': 'error',
+                'error': approval.get('error') or 'Summon approval requires an active browser session.',
+            },
+            ensure_ascii=False,
+        )
+    action, _, correction = parse_decision(approval.get('answers'), 'summon')
+    if action != 'approve':
+        return JSONCodec.dumps(
+            {'status': 'rejected', 'reason': correction or 'User rejected the summon.'},
+            ensure_ascii=False,
+        )
+
+    user = UserModel(**user_data)
+    parent_run = _parent_run(metadata)
+    prompt_files = _select_files(metadata, file_ids)
+    session_id = metadata.get('session_id') or ''
+    child_chat_context = {'messages': [], 'params': {}}
+    child_run = {
+        **copy.deepcopy(parent_run),
+        'model_id': role_model.id,
+        'tool_ids': role_tool_ids,
+        'chat_context': child_chat_context,
+        'files': [],
+    }
+
+    delegation_id = f'deleg_{uuid4().hex[:8]}'
+    chat_id = str(uuid4())
+    user_message_id = str(uuid4())
+    assistant_message_id = str(uuid4())
+    prompt = f'{task}\n\n## Context\n{context}' if context else task
+
+    user_message = {
+        'id': user_message_id,
+        'parentId': None,
+        'childrenIds': [assistant_message_id],
+        'role': 'user',
+        'content': prompt,
+        'timestamp': int(time.time()),
+        'models': [role_model.id],
+        **({'files': prompt_files} if prompt_files else {}),
+    }
+    assistant_message = {
+        'id': assistant_message_id,
+        'parentId': user_message_id,
+        'childrenIds': [],
+        'role': 'assistant',
+        'content': '',
+        'done': False,
+        'model': role_model.id,
+        'timestamp': int(time.time()),
+    }
+    delegation = {
+        'id': delegation_id,
+        'agent': agent,
+        'agent_name': role_name,
+        'parent_chat_id': parent_chat_id,
+        'parent_message_id': parent_message_id,
+        'child_chat_id': chat_id,
+        'status': 'active',
+        'contact_count': 0,
+        'contact_allowance': DEFAULT_CONTACT_ALLOWANCE,
+        'parent_run': parent_run,
+        'child_run': child_run,
+        'created_at': int(time.time()),
+        'updated_at': int(time.time()),
+    }
+
+    try:
+        chat = await Chats.insert_new_chat(
+            chat_id,
+            user.id,
+            ChatForm(
+                chat={
+                    'id': chat_id,
+                    'title': f'{role_name} — {task[:60]}',
+                    'models': [role_model.id],
+                    'history': {
+                        'currentId': assistant_message_id,
+                        'messages': {
+                            user_message_id: user_message,
+                            assistant_message_id: assistant_message,
+                        },
+                    },
+                    'messages': [
+                        {
+                            'role': 'user',
+                            'content': prompt,
+                            **({'files': prompt_files} if prompt_files else {}),
+                        }
+                    ],
+                    'files': prompt_files,
+                }
+            ),
+            internal_meta={'internal': False, 'delegation': delegation},
+        )
+    except Exception as exc:
+        log.exception('Failed to create visible subagent chat')
+        return f'Error: failed to create the subagent session: {exc}'
+    if not chat:
+        return 'Error: failed to create the subagent session.'
+
+    await register_delegation(parent_chat_id, delegation_id, chat_id)
+
+    child_request = await _build_request(request, user.id, internal=False, is_subagent=True)
+    child_request.state.chat_context = child_chat_context
+    child_request.state.max_tool_call_iterations = int(await Config.get('subagents.max_iterations', 30))
+    form_data = {
+        'model': role_model.id,
+        'messages': [{'role': 'user', 'content': prompt}],
+        'stream': True,
+        'chat_id': chat_id,
+        'id': assistant_message_id,
+        'parent_id': None,
+        'user_message': user_message,
+        'session_id': session_id or f'subagent:{chat_id}',
+        'background_tasks': {},
+        'tool_ids': role_tool_ids,
+        'skill_ids': copy.deepcopy(metadata.get('skill_ids') or []),
+        'filter_ids': copy.deepcopy(metadata.get('filter_ids') or []),
+        'features': copy.deepcopy(metadata.get('features') or {}),
+        'files': prompt_files,
+        'variables': copy.deepcopy(metadata.get('variables') or {}),
+        'chat_variables': copy.deepcopy(metadata.get('chat_variables')),
+    }
+    if metadata.get('terminal_id'):
+        form_data['terminal_id'] = metadata['terminal_id']
+    if metadata.get('folder_id'):
+        form_data['folder_id'] = metadata['folder_id']
+
+    async def run_child() -> None:
+        try:
+            await request.app.state.CHAT_COMPLETION_HANDLER(child_request, form_data, user=user)
+        except Exception:
+            log.exception('Visible subagent completion failed for %s', chat_id)
+
+    await create_task(request.app.state.redis, run_child(), id=chat_id)
+
+    link = f'{str(request.base_url).rstrip("/")}/c/{chat_id}'
+    return JSONCodec.dumps(
+        {
+            'status': 'dispatched',
+            'delegation_id': delegation_id,
+            'agent': role_name,
+            'chat_id': chat_id,
+            'link': link,
+            'message': f'{role_name} summoned. Chat with the subagent: {link}',
+        },
+        ensure_ascii=False,
+    )
+
+
+async def _append_parent_message(
+    parent_chat,
+    *,
+    delegation: dict,
+    content: str,
+    status: str,
+    agent_name: str,
+    user_id: str,
+) -> str:
+    history = (parent_chat.chat or {}).get('history') or {}
+    messages = history.get('messages') or {}
+    latest = parent_chat.current_message_id or history.get('currentId')
+    if latest not in messages:
+        latest = next(reversed(messages), None) if messages else None
+
+    message_id = str(uuid4())
+    message = {
+        'id': message_id,
+        'parentId': latest,
+        'childrenIds': [],
+        'role': 'user',
+        'content': f'[Subagent {agent_name}]\n\n{content}',
+        'model': (delegation.get('parent_run') or {}).get('model_id'),
+        'meta': {
+            'internal': True,
+            'type': 'subagent',
+            'delegation_id': delegation.get('id'),
+            'from': 'subagent',
+            'agent': agent_name,
+            'status': status,
+        },
+        'timestamp': int(time.time()),
+    }
+    await Chats.upsert_message_to_chat_by_id_and_message_id(parent_chat.id, message_id, message)
+
+    from open_webui.socket.main import sio
+
+    await sio.emit(
+        'events',
+        {'chat_id': parent_chat.id, 'message_id': message_id, 'data': {'type': 'chat:reload'}},
+        room=f'user:{user_id}',
+    )
+    return message_id
+
+
+async def _append_child_message(child_chat_id: str, content: str, user_id: str) -> None:
+    chat = await Chats.get_chat_by_id(child_chat_id)
+    if not chat:
+        return
+    history = (chat.chat or {}).get('history') or {}
+    messages = history.get('messages') or {}
+    latest = chat.current_message_id or history.get('currentId')
+    if latest not in messages:
+        latest = next(reversed(messages), None) if messages else None
+
+    message_id = str(uuid4())
+    message = {
+        'id': message_id,
+        'parentId': latest,
+        'childrenIds': [],
+        'role': 'user',
+        'content': content,
+        'meta': {'from': 'parent'},
+        'timestamp': int(time.time()),
+    }
+    await Chats.upsert_message_to_chat_by_id_and_message_id(child_chat_id, message_id, message)
+
+    from open_webui.socket.main import sio
+
+    await sio.emit(
+        'events',
+        {'chat_id': child_chat_id, 'message_id': message_id, 'data': {'type': 'chat:reload'}},
+        room=f'user:{user_id}',
+    )
+
+
+async def report_to_parent(
+    *,
+    child_chat_id: str,
+    user: UserModel,
+    content: str,
+    wake: bool,
+    event_call,
+    request: Request,
+) -> str:
+    content = (content or '').strip()
+    if not content:
+        return 'Error: message must not be empty.'
+
+    _, delegation = await get_delegation(child_chat_id)
+    if not delegation:
+        return 'Error: this session is not a delegated subagent.'
+    if delegation.get('status') in {'orphaned', 'cancelled'}:
+        return 'Error: the delegation is closed; the parent cannot be contacted.'
+
+    parent_chat_id = delegation.get('parent_chat_id')
+    parent_chat = await Chats.get_chat_by_id(parent_chat_id)
+    if not parent_chat:
+        await mark_orphaned(child_chat_id, 'parent_deleted')
+        return 'Error: the parent session was deleted; the delegation is closed.'
+
+    agent_name = delegation.get('agent_name') or delegation.get('agent') or 'Subagent'
+    count = int(delegation.get('contact_count') or 0)
+    allowance = int(delegation.get('contact_allowance') or DEFAULT_CONTACT_ALLOWANCE)
+
+    if wake and needs_quota_approval(count, allowance):
+        approval = await request_user_input(event_call, [quota_question(agent_name, count)])
+        if approval.get('status') != 'answered':
+            return JSONCodec.dumps(
+                {
+                    'status': 'error',
+                    'error': 'Contact approval requires an active browser session; use signal_completion_to_parent instead.',
+                },
+                ensure_ascii=False,
+            )
+        action, amount, correction = parse_decision(approval.get('answers'), 'quota')
+        if action == 'approve':
+            allowance = count + amount
+        elif action == 'reject':
+            await _append_child_message(
+                child_chat_id,
+                correction or 'The user rejected further parent contact. Continue without contacting the parent.',
+                user.id,
+            )
+            await update_delegation(child_chat_id, contact_allowance=allowance)
+            return JSONCodec.dumps(
+                {'status': 'rejected', 'correction': correction},
+                ensure_ascii=False,
+            )
+        else:
+            return 'Error: unrecognised approval answer; the contact was not sent.'
+
+    message_id = await _append_parent_message(
+        parent_chat,
+        delegation=delegation,
+        content=content,
+        status='pending' if wake else 'delivered',
+        agent_name=agent_name,
+        user_id=user.id,
+    )
+
+    if wake:
+        await update_delegation(
+            child_chat_id,
+            contact_count=count + 1,
+            contact_allowance=allowance,
+            status='active',
+        )
+        run = delegation.get('parent_run') or {}
+
+        async def wake_parent() -> None:
+            try:
+                await process_pending_internal_messages(request, parent_chat_id, user.id, run)
+            except Exception:
+                log.exception('Failed to wake parent %s for delegation %s', parent_chat_id, delegation.get('id'))
+
+        asyncio.create_task(wake_parent())
+        return JSONCodec.dumps({'status': 'delivered', 'message_id': message_id}, ensure_ascii=False)
+
+    await update_delegation(child_chat_id, status='completed')
+    return JSONCodec.dumps({'status': 'recorded', 'message_id': message_id}, ensure_ascii=False)
+
+
+async def dispatch_to_child(
+    *,
+    parent_chat_id: str,
+    delegation_id: str,
+    content: str,
+    request: Request,
+    user: UserModel,
+) -> str:
+    content = (content or '').strip()
+    if not content:
+        return 'Error: message must not be empty.'
+
+    child_chat_id = await resolve_child_chat_id(parent_chat_id, delegation_id)
+    if not child_chat_id:
+        return 'Error: delegation not found for this parent chat.'
+    chat, delegation = await get_delegation(child_chat_id)
+    if not delegation or not chat:
+        return 'Error: delegation record is missing.'
+    if delegation.get('status') in {'orphaned', 'cancelled'}:
+        return 'Error: the delegation is closed.'
+
+    child_run = delegation.get('child_run') or {}
+    model_id = child_run.get('model_id')
+    if not model_id:
+        return 'Error: the subagent run context is missing.'
+
+    history = (chat.chat or {}).get('history') or {}
+    messages = history.get('messages') or {}
+    latest = chat.current_message_id or history.get('currentId')
+    if latest not in messages:
+        latest = next(reversed(messages), None) if messages else None
+    message_list = [
+        {'role': item.get('role'), 'content': item.get('content')}
+        for item in get_message_list(messages, latest)
+        if item.get('role') in {'user', 'assistant'} and item.get('content')
+    ]
+
+    user_message_id = str(uuid4())
+    assistant_message_id = str(uuid4())
+    user_message = {
+        'id': user_message_id,
+        'parentId': latest,
+        'childrenIds': [assistant_message_id],
+        'role': 'user',
+        'content': content,
+        'meta': {'from': 'parent'},
+        'timestamp': int(time.time()),
+    }
+    assistant_message = {
+        'id': assistant_message_id,
+        'parentId': user_message_id,
+        'childrenIds': [],
+        'role': 'assistant',
+        'content': '',
+        'done': False,
+        'model': model_id,
+        'timestamp': int(time.time()),
+    }
+    await Chats.upsert_message_to_chat_by_id_and_message_id(child_chat_id, user_message_id, user_message)
+    await Chats.upsert_message_to_chat_by_id_and_message_id(child_chat_id, assistant_message_id, assistant_message)
+
+    child_request = await _build_request(request, user.id, internal=False, is_subagent=True)
+    child_chat_context = child_run.get('chat_context') or {'messages': [], 'params': {}}
+    child_request.state.chat_context = child_chat_context
+    child_request.state.max_tool_call_iterations = int(await Config.get('subagents.max_iterations', 30))
+    form_data = {
+        'model': model_id,
+        'messages': [*message_list, {'role': 'user', 'content': content}],
+        'stream': True,
+        'chat_id': child_chat_id,
+        'id': assistant_message_id,
+        'parent_id': user_message_id,
+        'user_message': user_message,
+        'session_id': child_run.get('session_id') or f'subagent:{child_chat_id}',
+        'background_tasks': {},
+        'tool_ids': child_run.get('tool_ids') or [],
+        'skill_ids': child_run.get('skill_ids') or [],
+        'filter_ids': child_run.get('filter_ids') or [],
+        'features': child_run.get('features') or {},
+        'files': child_run.get('files') or [],
+        'variables': child_run.get('variables') or {},
+        'chat_variables': child_run.get('chat_variables'),
+    }
+
+    async def run_child() -> None:
+        try:
+            await request.app.state.CHAT_COMPLETION_HANDLER(child_request, form_data, user=user)
+        except Exception:
+            log.exception('Subagent follow-up completion failed for %s', child_chat_id)
+
+    await create_task(request.app.state.redis, run_child(), id=child_chat_id)
+    await update_delegation(child_chat_id, status='active')
+    return JSONCodec.dumps({'status': 'dispatched', 'chat_id': child_chat_id}, ensure_ascii=False)

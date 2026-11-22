@@ -534,99 +534,33 @@ async def ask_user(
     Ask the user clarifying questions before continuing.
     Use this when the next step depends on user intent, preference, or a tradeoff that cannot be inferred safely.
 
-    :param questions: 1-3 question objects, each with id, header, question, and 2-3 options. Each option needs label and description.
-        List the option you recommend first; the UI labels the first option Recommended.
+    :param questions: 1-3 question objects. Each has id, header, question and 2-3 options.
+        Each option needs label, description and an optional value (defaults to label).
+        A question may add free_text blocks: {when: [option values], input_type: "text"|"number",
+        placeholder, multiline, required, min, max}. A reject_text block is shorthand for
+        {when: ["reject"], ...}. List the recommended option first; the UI labels it Recommended.
     :param allow_other: Whether users may enter a free-form answer instead of choosing one of the options
     :param timeout_ms: How long the browser should keep the prompt open before cancelling it
     :return: JSON with status and answers keyed by question id
     """
+    from open_webui.utils.ask_user import request_user_input
+
     try:
-        if not isinstance(questions, list) or not 1 <= len(questions) <= 3:
-            raise ValueError('ask_user requires 1-3 questions.')
-
-        normalized_questions = []
-        seen_ids = set()
-        for index, question in enumerate(questions):
-            if not isinstance(question, dict):
-                raise ValueError('Each question must be an object.')
-
-            question_id = str(question.get('id') or '').strip()[:64]
-            if not question_id:
-                raise ValueError('Each question requires a non-empty id.')
-            if question_id in seen_ids:
-                raise ValueError(f'Duplicate question id: {question_id}')
-            seen_ids.add(question_id)
-
-            options = question.get('options')
-            if not isinstance(options, list) or not 2 <= len(options) <= 3:
-                raise ValueError('Each question requires 2-3 options.')
-
-            normalized_options = []
-            for option in options:
-                if not isinstance(option, dict):
-                    raise ValueError('Each option must be an object.')
-
-                label = str(option.get('label') or '').strip()[:80]
-                description = str(option.get('description') or '').strip()[:240]
-                if not label or not description:
-                    raise ValueError('Each option requires a label and description.')
-
-                normalized_options.append(
-                    {
-                        'label': label,
-                        'description': description,
-                    }
-                )
-
-            question_text = str(question.get('question') or '').strip()[:500]
-            if not question_text:
-                raise ValueError('Each question requires question text.')
-
-            normalized_questions.append(
-                {
-                    'id': question_id,
-                    'header': str(question.get('header') or '').strip()[:48] or f'Question {index + 1}',
-                    'question': question_text,
-                    'options': normalized_options,
-                    'allow_other': bool(question.get('allow_other', allow_other)),
-                }
-            )
-
-        if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int) or not 60_000 <= timeout_ms <= 240_000:
-            timeout_ms = 120_000
-
-        if __event_call__ is None:
+        result = await request_user_input(
+            __event_call__,
+            questions,
+            allow_other=allow_other,
+            timeout_ms=timeout_ms,
+        )
+        if result.get('status') == 'error':
             return JSONCodec.dumps(
-                {
-                    'status': 'error',
-                    'error': 'User input requires an active browser session with WebSocket connection.',
-                },
+                {'status': 'error', 'error': result.get('error')},
                 ensure_ascii=False,
             )
-
-        output = await __event_call__(
-            {
-                'type': 'request:user_input',
-                'data': {
-                    'questions': normalized_questions,
-                    'allow_other': allow_other,
-                    'timeout_ms': timeout_ms,
-                },
-            }
-        )
-
-        if not isinstance(output, dict):
-            return JSONCodec.dumps({'status': 'error', 'error': 'Invalid user input response.'}, ensure_ascii=False)
-        if output.get('error'):
-            return JSONCodec.dumps({'status': 'error', 'error': output.get('error')}, ensure_ascii=False)
-        if output.get('status') == 'cancelled':
+        if result.get('status') == 'cancelled':
             return JSONCodec.dumps({'status': 'cancelled', 'answers': {}}, ensure_ascii=False)
-
         return JSONCodec.dumps(
-            {
-                'status': 'answered',
-                'answers': output.get('answers', {}),
-            },
+            {'status': 'answered', 'answers': result.get('answers', {})},
             ensure_ascii=False,
         )
     except Exception as e:
@@ -2003,28 +1937,59 @@ async def view_chat(
 async def delegate_task(
     task: str,
     context: str = '',
+    agent: str = '',
     file_ids: list[str] | None = None,
+    mode: str = 'session',
     background: bool = False,
     __request__: Request = None,
     __user__: dict = None,
     __metadata__: dict = None,
     __chat_id__: str = None,
     __message_id__: str = None,
+    __event_call__: callable = None,
 ) -> str:
     """
-    Delegate focused work to a parallel sub-agent using the current model and tools.
+    Delegate focused work to a Veramiko subagent.
 
-    :param task: The specific task for the sub-agent to complete
-    :param context: Relevant context, decisions, or file paths for the task
-    :param file_ids: Attached file IDs the sub-agent needs. Use this for images or files;
-        do not put file IDs only in context.
-    :param background: Return immediately and continue this chat when the sub-agent finishes
-    :return: Foreground result text, or a JSON dispatch handle for background work
+    A role session (mode="session", the default) creates a visible chat owned by
+    the user, asks for approval first, starts the subagent there, and returns a
+    link. The user can talk to the subagent directly. The subagent reports back
+    with contact_parent (wakes the parent) or signal_completion_to_parent (does
+    not wake it).
+
+    :param task: The concrete task for the subagent
+    :param context: Context the subagent needs (source ids, file paths, constraints)
+    :param agent: The role model id, e.g. veramiko-statistician
+    :param file_ids: Attached file IDs the subagent needs
+    :param mode: "session" (visible, default) or "task" (legacy hidden worker)
+    :param background: Legacy task mode only: return immediately
+    :return: JSON dispatch handle with the session link, or the legacy result
     """
     if __request__ is None:
         return 'Error: request context not available.'
-    if getattr(__request__.state, 'internal', False) is True:
+    if (
+        getattr(__request__.state, 'internal', False) is True
+        or getattr(__request__.state, 'is_subagent', False) is True
+    ):
         return 'Error: sub-agents cannot delegate recursively.'
+
+    if agent or mode == 'session':
+        if not agent:
+            return 'Error: agent is required for a visible subagent session.'
+        from open_webui.utils.subagents import delegate_session
+
+        return await delegate_session(
+            task,
+            context,
+            agent=agent,
+            file_ids=file_ids,
+            request=__request__,
+            user_data=__user__ or {},
+            metadata=__metadata__ or {},
+            parent_chat_id=__chat_id__ or '',
+            parent_message_id=__message_id__,
+            event_call=__event_call__,
+        )
 
     from open_webui.utils.subagents import delegate
 
@@ -2038,6 +2003,96 @@ async def delegate_task(
         metadata=__metadata__ or {},
         parent_chat_id=__chat_id__ or '',
         parent_message_id=__message_id__,
+    )
+
+
+async def contact_parent(
+    message: str,
+    __request__: Request = None,
+    __user__: dict = None,
+    __chat_id__: str = None,
+    __event_call__: callable = None,
+) -> str:
+    """
+    Contact the parent agent and wake it.
+
+    Use this when the parent must act or answer before the task can continue.
+    The message is injected into the parent chat and the parent runs when idle.
+    Contact count is limited; after the allowance the user is asked to approve
+    more, approve a custom number, or reject with a correction.
+
+    :param message: What the parent needs to know or do
+    :return: JSON receipt
+    """
+    if __request__ is None or not __chat_id__:
+        return 'Error: request and chat context are required.'
+    from open_webui.utils.subagents import report_to_parent
+
+    return await report_to_parent(
+        child_chat_id=__chat_id__,
+        user=UserModel(**__user__),
+        content=message,
+        wake=True,
+        event_call=__event_call__,
+        request=__request__,
+    )
+
+
+async def signal_completion_to_parent(
+    message: str,
+    __request__: Request = None,
+    __user__: dict = None,
+    __chat_id__: str = None,
+    __event_call__: callable = None,
+) -> str:
+    """
+    Report completion to the parent without waking it.
+
+    The report is placed in the parent chat and enters the parent's context on
+    its next turn. Use this for the normal end of the task; use contact_parent
+    only when the parent must act now.
+
+    :param message: Summary, artifacts and open questions
+    :return: JSON receipt
+    """
+    if __request__ is None or not __chat_id__:
+        return 'Error: request and chat context are required.'
+    from open_webui.utils.subagents import report_to_parent
+
+    return await report_to_parent(
+        child_chat_id=__chat_id__,
+        user=UserModel(**__user__),
+        content=message,
+        wake=False,
+        event_call=__event_call__,
+        request=__request__,
+    )
+
+
+async def message_subagent(
+    delegation_id: str,
+    message: str,
+    __request__: Request = None,
+    __user__: dict = None,
+    __chat_id__: str = None,
+) -> str:
+    """
+    Send a message to a subagent session you delegated.
+
+    :param delegation_id: The id returned by delegate_task
+    :param message: The message to deliver
+    :return: JSON dispatch receipt
+    """
+    if __request__ is None or not __chat_id__:
+        return 'Error: request and chat context are required.'
+    from open_webui.utils.subagents import dispatch_to_child
+
+    return await dispatch_to_child(
+        parent_chat_id=__chat_id__,
+        delegation_id=delegation_id,
+        content=message,
+        request=__request__,
+        user=UserModel(**__user__),
     )
 
 

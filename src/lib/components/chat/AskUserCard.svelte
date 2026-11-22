@@ -8,9 +8,20 @@
 	const i18n: Writable<i18nType> = getContext('i18n');
 	const dispatch = createEventDispatcher();
 
+	type FreeTextBlock = {
+		when: string[];
+		input_type?: 'text' | 'number';
+		placeholder?: string;
+		multiline?: boolean;
+		required?: boolean;
+		min?: number;
+		max?: number;
+	};
+
 	type AskUserOption = {
 		label: string;
 		description: string;
+		value?: string;
 	};
 
 	type AskUserQuestion = {
@@ -18,6 +29,7 @@
 		header: string;
 		question: string;
 		options: AskUserOption[];
+		free_text?: FreeTextBlock[];
 		allow_other?: boolean;
 	};
 
@@ -27,6 +39,8 @@
 				option_index: number;
 				label: string;
 				description: string;
+				value: string;
+				text: string;
 		  }
 		| {
 				type: 'other';
@@ -80,12 +94,52 @@
 	$: question = questions[questionIndex];
 	$: selectedAnswer = question ? answers[question.id] : undefined;
 
+	const optionValue = (question: AskUserQuestion, index: number) =>
+		question.options[index]?.value ?? question.options[index]?.label ?? '';
+
+	const selectedValue = (answer: DraftAnswer | undefined) =>
+		answer?.type === 'option' ? answer.value : '';
+
+	const activeFreeText = (question: AskUserQuestion, answer = answers[question.id]) => {
+		const value = selectedValue(answer);
+		return (question.free_text || []).filter((block) => block.when?.includes(value));
+	};
+
+	const optionText = (question: AskUserQuestion) => {
+		const answer = answers[question.id];
+		return answer?.type === 'option' ? answer.text : '';
+	};
+
+	const updateOptionText = (question: AskUserQuestion, text: string) => {
+		const answer = answers[question.id];
+		if (answer?.type !== 'option') return;
+		answers = { ...answers, [question.id]: { ...answer, text } };
+	};
+
+	const answerIsComplete = (question: AskUserQuestion, answer: DraftAnswer | undefined) => {
+		if (answer?.type === 'other') {
+			return answer.text.trim() !== '';
+		}
+		if (answer?.type !== 'option') {
+			return false;
+		}
+		return activeFreeText(question, answer).every((block) => {
+			if (block.required === false) return true;
+			const value = answer.text.trim();
+			if (!value) return false;
+			if (block.input_type === 'number') {
+				const number = Number(value);
+				if (!Number.isFinite(number)) return false;
+				if (block.min !== undefined && number < block.min) return false;
+				if (block.max !== undefined && number > block.max) return false;
+			}
+			return true;
+		});
+	};
+
 	const hasAnswers = (selected = answers) =>
 		questions.length > 0 &&
-		questions.every((question) => {
-			const answer = selected[question.id];
-			return answer?.type === 'option' || (answer?.type === 'other' && answer.text.trim() !== '');
-		});
+		questions.every((question) => answerIsComplete(question, selected[question.id]));
 
 	$: complete = hasAnswers(answers);
 
@@ -98,7 +152,7 @@
 		for (const question of questions) {
 			const answer = selected[question.id];
 			if (answer?.type === 'option') {
-				normalized[question.id] = answer;
+				normalized[question.id] = { ...answer, text: answer.text.trim() };
 			} else if (answer?.type === 'other') {
 				normalized[question.id] = {
 					type: 'other',
@@ -129,11 +183,16 @@
 				type: 'option',
 				option_index: index,
 				label: option.label,
-				description: option.description
+				description: option.description,
+				value: optionValue(question, index),
+				text: ''
 			}
 		};
 		answers = selected;
-		advance(selected);
+		// An option with a free-text block needs the user to type before submitting.
+		if (activeFreeText(question, selected[question.id]).length === 0) {
+			advance(selected);
+		}
 	};
 
 	const selectOther = (question: AskUserQuestion) => {
@@ -230,6 +289,32 @@
 									</button>
 								{/each}
 							</div>
+
+							{#each activeFreeText(question) as block}
+								<div class="flex min-w-0 items-baseline gap-2 rounded-lg py-1.5">
+									{#if block.multiline}
+										<textarea
+											class="min-w-0 flex-1 resize-none bg-transparent text-xs text-gray-800 outline-hidden placeholder:text-gray-400 dark:text-gray-100 dark:placeholder:text-gray-500"
+											rows="2"
+											placeholder={block.placeholder || $i18n.t('Type your answer')}
+											value={optionText(question)}
+											aria-label={block.placeholder}
+											on:input={(event) => updateOptionText(question, event.currentTarget.value)}
+										/>
+									{:else}
+										<input
+											class="min-w-0 flex-1 bg-transparent text-xs text-gray-800 outline-hidden placeholder:text-gray-400 dark:text-gray-100 dark:placeholder:text-gray-500"
+											type={block.input_type === 'number' ? 'number' : 'text'}
+											min={block.min}
+											max={block.max}
+											placeholder={block.placeholder || $i18n.t('Type your answer')}
+											value={optionText(question)}
+											aria-label={block.placeholder}
+											on:input={(event) => updateOptionText(question, event.currentTarget.value)}
+										/>
+									{/if}
+								</div>
+							{/each}
 
 							{#if questionAllowsOther(question)}
 								<div class="flex min-w-0 items-baseline gap-2 rounded-lg py-1.5">
