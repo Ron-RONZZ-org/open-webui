@@ -74,6 +74,7 @@
 		removeAllDetails
 	} from '$lib/utils';
 	import { setTextScale } from '$lib/utils/text-scale';
+	import { installSelectionCopyHandler } from '$lib/utils/clipboard';
 
 	import NotificationToast from '$lib/components/NotificationToast.svelte';
 	import AppSidebar from '$lib/components/app/AppSidebar.svelte';
@@ -1120,7 +1121,11 @@
 		}
 	};
 
+	let uninstallSelectionCopyHandler: (() => void) | null = null;
+
 	onMount(async () => {
+		uninstallSelectionCopyHandler = installSelectionCopyHandler();
+
 		const originalFetch = window.fetch.bind(window);
 		window.fetch = async (input, init) => {
 			const response = await originalFetch(input, init);
@@ -1438,6 +1443,7 @@
 	}
 
 	onDestroy(() => {
+		uninstallSelectionCopyHandler?.();
 		bc.close();
 	});
 </script>
