@@ -60,6 +60,8 @@ def subagent_session_prompt(delegation: dict | None) -> str:
     """
     if not delegation:
         return ''
+    if delegation.get('status') in {'orphaned', 'cancelled'}:
+        return ''
     agent_name = str(delegation.get('agent_name') or delegation.get('agent') or 'the subagent').strip()
     parent_model = str((delegation.get('parent_run') or {}).get('model_id') or '').strip()
     parent = f' (`{parent_model}`)' if parent_model else ''

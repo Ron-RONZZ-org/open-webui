@@ -17,6 +17,8 @@ from open_webui.utils.subagent_roles import (
 def test_subagent_session_prompt_is_empty_without_delegation():
     assert subagent_session_prompt(None) == ''
     assert subagent_session_prompt({}) == ''
+    assert subagent_session_prompt({'status': 'orphaned', 'agent': 'veramiko-plotter'}) == ''
+    assert subagent_session_prompt({'status': 'cancelled', 'agent': 'veramiko-plotter'}) == ''
 
 
 def test_subagent_session_prompt_names_agent_parent_and_tools():
