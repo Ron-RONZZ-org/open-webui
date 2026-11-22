@@ -8,9 +8,31 @@ from open_webui.utils.subagent_roles import (
     needs_quota_approval,
     parse_decision,
     quota_question,
+    subagent_session_prompt,
     summon_question,
     tag_names,
 )
+
+
+def test_subagent_session_prompt_is_empty_without_delegation():
+    assert subagent_session_prompt(None) == ''
+    assert subagent_session_prompt({}) == ''
+
+
+def test_subagent_session_prompt_names_agent_parent_and_tools():
+    prompt = subagent_session_prompt(
+        {
+            'id': 'deleg_abc123',
+            'agent': 'veramiko-plotter',
+            'agent_name': 'Veramiko Plotter',
+            'parent_run': {'model_id': 'veramiko-librarian'},
+        }
+    )
+    assert 'Veramiko Plotter' in prompt
+    assert 'veramiko-librarian' in prompt
+    assert 'deleg_abc123' in prompt
+    assert 'contact_parent' in prompt
+    assert 'signal_completion_to_parent' in prompt
 
 
 def test_tag_names_accepts_strings_and_dicts():
