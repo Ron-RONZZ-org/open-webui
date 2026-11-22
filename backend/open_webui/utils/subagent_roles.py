@@ -10,6 +10,22 @@ AGENT_TAG = 'veramiko-agent'
 DEFAULT_CONTACT_ALLOWANCE = 5
 MAX_CONTACT_ALLOWANCE = 100
 
+SUBAGENT_SESSION_PROMPT = """## Subagent session
+
+You are **{agent_name}**, summoned by a parent agent{parent} (not the user) in
+this session. The first message is the task brief; the user may also talk to you
+directly here.
+
+- Do not delegate further.
+- Use `contact_parent(message)` when you need a decision or missing data; group
+  your questions. It wakes the parent.
+- End with `signal_completion_to_parent(message)` containing the artifact
+  (`File:` title, `[[File:…]]`/embed snippet), what you did, and any caveat. It
+  does not wake the parent; it enters its context on its next turn.
+- If the user asks for more work after you signal completion, continue here and
+  signal completion again once the user validates.
+"""
+
 
 def tag_names(tags) -> list[str]:
     """Normalise the several tag shapes OWUI accepts into lower-case names."""
@@ -33,6 +49,27 @@ def is_agent_model(meta: dict | None, base_model_id: str | None) -> bool:
 
 def agent_tool_ids(meta: dict | None) -> list[str]:
     return [str(item) for item in ((meta or {}).get('toolIds') or []) if item]
+
+
+def subagent_session_prompt(delegation: dict | None) -> str:
+    """Build the system brief for a visible subagent session.
+
+    The visible-session path sends only the task message, so the child must be
+    told explicitly that it was delegated to. Returns '' when the chat is not a
+    visible delegation.
+    """
+    if not delegation:
+        return ''
+    if delegation.get('status') in {'orphaned', 'cancelled'}:
+        return ''
+    agent_name = str(delegation.get('agent_name') or delegation.get('agent') or 'the subagent').strip()
+    parent_model = str((delegation.get('parent_run') or {}).get('model_id') or '').strip()
+    parent = f' (`{parent_model}`)' if parent_model else ''
+    prompt = SUBAGENT_SESSION_PROMPT.format(agent_name=agent_name or 'the subagent', parent=parent)
+    delegation_id = str(delegation.get('id') or '').strip()
+    if delegation_id:
+        prompt += f'\nDelegation id: `{delegation_id}`.\n'
+    return prompt
 
 
 def needs_quota_approval(contact_count: int, contact_allowance: int) -> bool:

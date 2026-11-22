@@ -141,6 +141,7 @@ from open_webui.utils.skills import (
     replace_skill_mentions_with_labels,
     strip_skill_mentions,
 )
+from open_webui.utils.subagent_roles import subagent_session_prompt
 from open_webui.utils.task import (
     get_task_model_id,
     rag_template,
@@ -3464,6 +3465,17 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             sources.extend(flags.get('sources', []))
         except Exception as e:
             log.exception(e)
+
+    # A visible subagent session is a normal user-owned chat. Unlike the legacy
+    # hidden path it carries no subagent system message, so tell the model it
+    # was delegated to (and how to report) on every turn, not only the first.
+    delegation = (chat.meta or {}).get('delegation') if chat else None
+    delegation_prompt = subagent_session_prompt(delegation)
+    if delegation_prompt:
+        current_system = get_system_message(form_data['messages'])
+        current_text = get_content_from_message(current_system) if current_system else ''
+        if delegation_prompt not in (current_text or ''):
+            form_data['messages'] = add_or_update_system_message(delegation_prompt, form_data['messages'], append=True)
 
     # The tool loop restores these prompts before rebuilding file and tool source context.
     system_message = get_system_message(form_data['messages'])
