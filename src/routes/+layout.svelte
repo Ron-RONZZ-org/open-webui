@@ -1121,7 +1121,7 @@
 		}
 	};
 
-	let uninstallSelectionCopyHandler: (() => void) | null = null;
+	let uninstallSelectionCopyHandler = null;
 
 	onMount(async () => {
 		uninstallSelectionCopyHandler = installSelectionCopyHandler();
