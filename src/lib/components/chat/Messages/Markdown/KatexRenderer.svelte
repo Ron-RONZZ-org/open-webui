@@ -20,6 +20,8 @@
 	import { copyToClipboard } from '$lib/utils';
 	import { toast } from 'svelte-sonner';
 
+	import Clipboard from '$lib/components/icons/Clipboard.svelte';
+
 	const i18n = getContext('i18n');
 
 	export let content: string;
@@ -30,6 +32,12 @@
 	onMount(async () => {
 		renderToString = await getKatexRenderer();
 	});
+
+	const copy = async () => {
+		if (await copyToClipboard(content)) {
+			toast.success($i18n.t('Copied to clipboard'));
+		}
+	};
 
 	// Cache rendered HTML — only re-compute when content, displayMode, or renderToString changes,
 	// not on every parent re-render during streaming
@@ -52,12 +60,21 @@
 	<!-- svelte-ignore a11y-no-static-element-interactions -->
 	<svelte:element
 		this={displayMode ? 'div' : 'span'}
-		class="cursor-pointer"
-		on:click={() => {
-			copyToClipboard(content);
-			toast.success($i18n.t('Copied to clipboard'));
-		}}
+		class="cursor-pointer {displayMode ? 'group relative' : ''}"
+		title={$i18n.t('Copy LaTeX')}
+		on:click={copy}
 	>
 		{@html renderedHTML}
+		{#if displayMode}
+			<button
+				type="button"
+				class="hover-reveal absolute right-1 top-1 z-20 rounded-lg bg-white/80 p-1 text-gray-500 transition hover:bg-gray-50 dark:bg-gray-850/80 dark:text-gray-300 dark:hover:bg-gray-800"
+				title={$i18n.t('Copy LaTeX')}
+				aria-label={$i18n.t('Copy LaTeX')}
+				on:click|stopPropagation={copy}
+			>
+				<Clipboard className="size-3.5" strokeWidth="1.5" />
+			</button>
+		{/if}
 	</svelte:element>
 {/if}

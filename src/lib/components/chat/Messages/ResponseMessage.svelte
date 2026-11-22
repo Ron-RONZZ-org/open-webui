@@ -39,6 +39,11 @@
 		removeAllDetails
 	} from '$lib/utils';
 	import { WEBUI_API_BASE_URL, WEBUI_BASE_URL } from '$lib/constants';
+	import {
+		buildSelectionCopyPayload,
+		isEditableSelection,
+		isEditableTarget
+	} from '$lib/utils/clipboard';
 	import { resolveLocalizedModelName } from '$lib/utils/localizedContent';
 	import equal from 'fast-deep-equal';
 
@@ -613,32 +618,32 @@
 		}
 	};
 
-	const contentCopyHandler = (e) => {
-		if (contentContainerElement) {
-			e.preventDefault();
-			// Get the selected HTML
-			const selection = window.getSelection();
-			const range = selection.getRangeAt(0);
-			const tempDiv = document.createElement('div');
-
-			// Remove background, color, and font styles
-			tempDiv.appendChild(range.cloneContents());
-
-			tempDiv.querySelectorAll('table').forEach((table) => {
-				table.style.borderCollapse = 'collapse';
-				table.style.width = 'auto';
-				table.style.tableLayout = 'auto';
-			});
-
-			tempDiv.querySelectorAll('th').forEach((th) => {
-				th.style.whiteSpace = 'nowrap';
-				th.style.padding = '4px 8px';
-			});
-
-			// Put cleaned HTML + plain text into clipboard
-			e.clipboardData.setData('text/html', tempDiv.innerHTML);
-			e.clipboardData.setData('text/plain', selection.toString());
+	const contentCopyHandler = (e: ClipboardEvent) => {
+		if (!contentContainerElement || !e.clipboardData) {
+			return;
 		}
+		if (isEditableTarget(e.target)) {
+			return;
+		}
+
+		const selection = window.getSelection();
+		if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
+			return;
+		}
+		if (isEditableSelection(selection)) {
+			return;
+		}
+
+		const payload = buildSelectionCopyPayload(selection);
+		if (!payload) {
+			return;
+		}
+
+		// Put cleaned HTML + plain text into clipboard. Math selections are
+		// written as `$...$` / `$$...$$` instead of the duplicated rendered markup.
+		e.clipboardData.setData('text/html', payload.html);
+		e.clipboardData.setData('text/plain', payload.text);
+		e.preventDefault();
 	};
 
 	onMount(async () => {
