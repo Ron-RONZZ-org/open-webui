@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from open_webui.utils.ask_user import normalize_ask_user_request, request_user_input
@@ -107,19 +109,17 @@ def test_duplicate_option_values_are_rejected():
         )
 
 
-@pytest.mark.asyncio
-async def test_request_user_input_without_event_call():
-    result = await request_user_input(None, [_question()])
+def test_request_user_input_without_event_call():
+    result = asyncio.run(request_user_input(None, [_question()]))
     assert result['status'] == 'error'
     assert 'browser session' in result['error']
 
 
-@pytest.mark.asyncio
-async def test_request_user_input_returns_answers():
+def test_request_user_input_returns_answers():
     async def event_call(event):
         assert event['type'] == 'request:user_input'
         return {'status': 'answered', 'answers': {'q1': {'value': 'approve:5', 'text': ''}}}
 
-    result = await request_user_input(event_call, [_question()])
+    result = asyncio.run(request_user_input(event_call, [_question()]))
     assert result['status'] == 'answered'
     assert result['answers']['q1']['value'] == 'approve:5'
